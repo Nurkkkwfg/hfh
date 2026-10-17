@@ -2,12 +2,39 @@ import asyncio
 import logging
 
 from aiogram import Bot, Dispatcher
+from aiogram.exceptions import TelegramAPIError
 from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.types import ErrorEvent
 
 from config import Settings
 from database.session import create_database, initialize_database
 from handlers import admin, courier, dispatcher as dispatcher_handlers, fallback, laundry
 from handlers.common import DatabaseMiddleware
+
+logger = logging.getLogger(__name__)
+USER_ERROR_MESSAGE = "Произошла ошибка, попробуйте ещё раз."
+
+
+async def handle_unhandled_error(event: ErrorEvent) -> bool:
+    error = event.exception
+    logger.error(
+        "Unhandled error while processing update",
+        exc_info=(type(error), error, error.__traceback__),
+    )
+    callback = event.update.callback_query
+    if callback is not None:
+        try:
+            await callback.answer(USER_ERROR_MESSAGE, show_alert=True)
+        except TelegramAPIError:
+            logger.warning("Could not answer failed callback query", exc_info=True)
+        return True
+    message = event.update.message or event.update.edited_message
+    if message is not None:
+        try:
+            await message.answer(USER_ERROR_MESSAGE)
+        except TelegramAPIError:
+            logger.warning("Could not send error message to user", exc_info=True)
+    return True
 
 
 def create_dispatcher(settings: Settings, session_factory) -> Dispatcher:
@@ -21,6 +48,8 @@ def create_dispatcher(settings: Settings, session_factory) -> Dispatcher:
     dp.include_router(courier.router)
     dp.include_router(laundry.router)
     dp.include_router(fallback.router)
+
+    dp.errors.register(handle_unhandled_error)
     return dp
 
 

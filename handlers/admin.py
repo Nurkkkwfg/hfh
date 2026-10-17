@@ -17,6 +17,7 @@ from handlers.common import (
     role_keyboard,
     status_label,
 )
+from utils.dates import format_bishkek_datetime
 
 router = Router(name="admin")
 logger = logging.getLogger(__name__)
@@ -72,6 +73,7 @@ async def start(message: Message, db, bot: Bot, settings: Settings, user_role: s
         return
 
     user = await db.get(User, person.id)
+    is_new_user = user is None
     if user is None:
         user = User(
             telegram_id=person.id,
@@ -82,7 +84,11 @@ async def start(message: Message, db, bot: Bot, settings: Settings, user_role: s
         db.add(user)
         await db.commit()
 
-    if not user.is_approved:
+    if not user.is_approved and not is_new_user:
+        await message.answer("Запрос уже отправлен, ожидайте.")
+        return
+
+    if is_new_user:
         keyboard = InlineKeyboardMarkup(
             inline_keyboard=[
                 [InlineKeyboardButton(text=label, callback_data=f"staff:role:{person.id}:{role}")]
@@ -137,7 +143,8 @@ async def list_staff(message: Message, db, settings: Settings):
         if not user.is_approved:
             status = "Ожидает одобрения"
         await message.answer(
-            f"{user.full_name} | ID {user.telegram_id} | {status}",
+            f"{user.full_name} | ID {user.telegram_id} | {status} | "
+            f"Создан: {format_bishkek_datetime(user.created_at)}",
             reply_markup=staff_action_keyboard(user, settings.admin_ids),
         )
 
@@ -202,7 +209,8 @@ async def admin_orders(message: Message, db, settings: Settings):
     for order in orders:
         text = (
             f"Заказ #{order.id}\nКлиент: {order.client_name}\nАдрес: {order.address}\n"
-            f"Забор: {order.pickup_day}\nСтатус: {status_label(order.status)}"
+            f"Забор: {order.pickup_day}\nСтатус: {status_label(order.status)}\n"
+            f"Создан: {format_bishkek_datetime(order.created_at)}"
         )
         keyboard = None
         if order.status not in {"delivered", "cancelled"}:
@@ -286,6 +294,16 @@ async def disable_staff(callback: CallbackQuery, db, bot: Bot, settings: Setting
     if user_id in settings.admin_ids:
         await callback.answer("Нельзя отключить настроенного администратора.", show_alert=True)
         return
+    await db.execute(
+        update(Order)
+        .where(Order.status == "pickup_en_route", Order.pickup_courier_id == user_id)
+        .values(status="new", pickup_courier_id=None)
+    )
+    await db.execute(
+        update(Order)
+        .where(Order.status == "delivery_en_route", Order.delivery_courier_id == user_id)
+        .values(status="ready", delivery_courier_id=None)
+    )
     result = await db.execute(
         update(User)
         .where(User.telegram_id == user_id, User.is_approved.is_(True))

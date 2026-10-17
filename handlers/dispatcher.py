@@ -12,7 +12,7 @@ from aiogram.types import (
     Message,
     ReplyKeyboardMarkup,
 )
-from sqlalchemy import select
+from sqlalchemy import select, update
 
 from config import Settings
 from database.models import Order
@@ -208,17 +208,25 @@ async def _finish_address(message, state: FSMContext, db, settings: Settings, de
     await state.update_data(address=address)
 
     if data.get("address_flow") == "edit":
-        order = await db.get(Order, data["edit_order_id"])
-        if order is None or order.status in {"delivered", "cancelled"}:
-            await state.clear()
-            await message.answer("Заказ не найден или уже закрыт.")
-            return
         coordinates = await geocode_bishkek_address(
             base_address, settings.geocoder_url, settings.geocoder_user_agent
         )
-        order.address = address
-        order.latitude, order.longitude = coordinates or (None, None)
+        result = await db.execute(
+            update(Order)
+            .where(Order.id == data["edit_order_id"], Order.status == "new")
+            .values(
+                address=address,
+                latitude=coordinates[0] if coordinates else None,
+                longitude=coordinates[1] if coordinates else None,
+            )
+        )
+        if result.rowcount != 1:
+            await db.rollback()
+            await state.clear()
+            await message.answer("Адрес можно изменить только у нового заказа.")
+            return
         await db.commit()
+        order = await db.get(Order, data["edit_order_id"])
         await state.clear()
         await message.answer("Адрес обновлён.", reply_markup=role_keyboard(ROLE_DISPATCHER))
         await send_order_card(message, order, show_dispatcher_actions=True)
@@ -293,8 +301,11 @@ async def begin_edit(callback: CallbackQuery, state: FSMContext, db):
         await callback.answer("Некорректный номер заказа.", show_alert=True)
         return
     order = await db.get(Order, order_id)
-    if order is None or order.status in {"delivered", "cancelled"}:
-        await callback.answer("Заказ уже закрыт или не найден.", show_alert=True)
+    if order is None:
+        await callback.answer("Заказ не найден.", show_alert=True)
+        return
+    if order.status != "new":
+        await callback.answer("Изменять можно только новый заказ.", show_alert=True)
         return
     await state.clear()
     if callback.message:
@@ -309,7 +320,7 @@ async def begin_edit(callback: CallbackQuery, state: FSMContext, db):
 
 
 @router.callback_query(F.data.startswith("dispatch:field:"))
-async def choose_edit_field(callback: CallbackQuery, state: FSMContext):
+async def choose_edit_field(callback: CallbackQuery, state: FSMContext, db):
     try:
         _, _, order_id_raw, field = callback.data.split(":", 3)
         order_id = int(order_id_raw)
@@ -318,6 +329,10 @@ async def choose_edit_field(callback: CallbackQuery, state: FSMContext):
         return
     if field not in EDIT_FIELDS:
         await callback.answer("Неизвестное поле заказа.", show_alert=True)
+        return
+    order = await db.get(Order, order_id)
+    if order is None or order.status != "new":
+        await callback.answer("Изменять можно только новый заказ.", show_alert=True)
         return
     if field == "address":
         await state.update_data(address_flow="edit", edit_order_id=order_id)
@@ -330,7 +345,6 @@ async def choose_edit_field(callback: CallbackQuery, state: FSMContext):
     await state.update_data(edit_order_id=order_id, edit_field=field)
     prompts = {
         "client_name": "Введите новое имя клиента:",
-        "address": "Введите новый полный адрес:",
         "pickup_day": "Введите день забора (например, завтра или 25.10.2026):",
     }
     if callback.message:
@@ -339,17 +353,12 @@ async def choose_edit_field(callback: CallbackQuery, state: FSMContext):
 
 
 @router.message(OrderForm.edit_value)
-async def save_edit(message: Message, state: FSMContext, db, settings: Settings):
+async def save_edit(message: Message, state: FSMContext, db):
     value = (message.text or "").strip()
     if not value:
         await message.answer("Значение не должно быть пустым. Введите его текстом:")
         return
     data = await state.get_data()
-    order = await db.get(Order, data["edit_order_id"])
-    if order is None or order.status in {"delivered", "cancelled"}:
-        await state.clear()
-        await message.answer("Заказ не найден или уже закрыт.")
-        return
     field = data["edit_field"]
     if field == "pickup_day":
         normalized_pickup_day = normalize_pickup_day(value)
@@ -357,11 +366,18 @@ async def save_edit(message: Message, state: FSMContext, db, settings: Settings)
             await message.answer("Укажите «Сегодня», «Завтра» или будущую дату в формате ДД.ММ.ГГГГ:")
             return
         value = normalized_pickup_day
-    setattr(order, field, value)
-    if field == "address":
-        coordinates = await geocode_bishkek_address(order.address, settings.geocoder_url, settings.geocoder_user_agent)
-        order.latitude, order.longitude = coordinates or (None, None)
+    result = await db.execute(
+        update(Order)
+        .where(Order.id == data["edit_order_id"], Order.status == "new")
+        .values({field: value})
+    )
+    if result.rowcount != 1:
+        await db.rollback()
+        await state.clear()
+        await message.answer("Изменять можно только новый заказ.")
+        return
     await db.commit()
+    order = await db.get(Order, data["edit_order_id"])
     await state.clear()
     await message.answer("Данные обновлены.")
     await send_order_card(message, order, show_dispatcher_actions=True)
@@ -374,12 +390,16 @@ async def cancel_order(callback: CallbackQuery, db):
     except (AttributeError, ValueError):
         await callback.answer("Некорректный номер заказа.", show_alert=True)
         return
-    order = await db.get(Order, order_id)
-    if order is None or order.status in {"delivered", "cancelled"}:
-        await callback.answer("Заказ уже закрыт или не найден.", show_alert=True)
+    result = await db.execute(
+        update(Order)
+        .where(Order.id == order_id, Order.status == "new")
+        .values(status="cancelled")
+    )
+    if result.rowcount != 1:
+        await db.rollback()
+        await callback.answer("Отменить можно только новый заказ.", show_alert=True)
         return
-    order.status = "cancelled"
     await db.commit()
     await callback.answer("Заказ отменён.")
     if callback.message:
-        await callback.message.edit_text(f"Заказ #{order.id} отменён.")
+        await callback.message.edit_text(f"Заказ #{order_id} отменён.")

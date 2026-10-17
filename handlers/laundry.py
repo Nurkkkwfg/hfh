@@ -3,6 +3,7 @@ from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
+from sqlalchemy import update
 
 from database.models import Order
 from handlers.common import ROLE_LAUNDRY, RoleFilter, role_keyboard, status_label
@@ -67,7 +68,9 @@ async def show_order(message: Message, db, raw_order_id: str):
         await message.answer(f"Заказ #{order_id} не найден.")
         return
     if order.status not in {"picked_up", "processing", "ready", "delivered", "cancelled"}:
-        await message.answer(f"Заказ #{order.id} пока не передан в цех (статус: {order.status}).")
+        await message.answer(
+            f"Заказ #{order.id} пока не передан в цех (статус: {status_label(order.status)})."
+        )
         return
     buttons = []
     if order.status in {"picked_up", "processing"}:
@@ -103,14 +106,19 @@ async def save_measurement(message: Message, state: FSMContext, db):
         await message.answer("Введите замеры текстом:")
         return
     data = await state.get_data()
-    order = await db.get(Order, data["order_id"])
-    if order is None or order.status not in {"picked_up", "processing"}:
+    order_id = data["order_id"]
+    result = await db.execute(
+        update(Order)
+        .where(Order.id == order_id, Order.status.in_(["picked_up", "processing"]))
+        .values(measurements=measurements, status="processing")
+    )
+    if result.rowcount != 1:
+        await db.rollback()
         await state.clear()
         await message.answer("Заказ уже недоступен для изменения.")
         return
-    order.measurements = measurements
-    order.status = "processing"
     await db.commit()
+    order = await db.get(Order, order_id)
     await state.clear()
     await message.answer(f"Замеры сохранены для заказа #{order.id}.")
     await show_order(message, db, str(order.id))
@@ -123,12 +131,16 @@ async def mark_ready(callback: CallbackQuery, db):
     except (AttributeError, ValueError):
         await callback.answer("Некорректный номер заказа.", show_alert=True)
         return
-    order = await db.get(Order, order_id)
-    if order is None or order.status not in {"picked_up", "processing"}:
+    result = await db.execute(
+        update(Order)
+        .where(Order.id == order_id, Order.status.in_(["picked_up", "processing"]))
+        .values(status="ready")
+    )
+    if result.rowcount != 1:
+        await db.rollback()
         await callback.answer("Заказ не найден или его статус уже изменился.", show_alert=True)
         return
-    order.status = "ready"
     await db.commit()
     await callback.answer("Заказ добавлен в очередь доставки.")
     if callback.message:
-        await callback.message.edit_text(f"Заказ #{order.id}: готов к доставке.")
+        await callback.message.edit_text(f"Заказ #{order_id}: готов к доставке.")

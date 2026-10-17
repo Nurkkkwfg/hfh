@@ -3,6 +3,7 @@ from aiogram.filters import BaseFilter
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton, Message, ReplyKeyboardMarkup
 
 from database.models import User
+from utils.dates import format_bishkek_datetime
 
 ROLE_DISPATCHER = "dispatcher"
 ROLE_COURIER = "courier"
@@ -66,11 +67,12 @@ def role_keyboard(role: str) -> ReplyKeyboardMarkup:
 async def send_order_card(message: Message, order, *, show_dispatcher_actions: bool = False) -> None:
     text = (
         f"Заказ #{order.id}\nКлиент: {order.client_name}\nАдрес: {order.address}\n"
-        f"Забор: {order.pickup_day}\nСтатус: {status_label(order.status)}"
+        f"Забор: {order.pickup_day}\nСтатус: {status_label(order.status)}\n"
+        f"Создан: {format_bishkek_datetime(order.created_at)}"
     )
     if order.measurements:
         text += f"\nЗамеры: {order.measurements}"
-    if show_dispatcher_actions:
+    if show_dispatcher_actions and order.status not in {"delivered", "cancelled"}:
         keyboard = InlineKeyboardMarkup(
             inline_keyboard=[
                 [InlineKeyboardButton(text="✏️ Изменить", callback_data=f"dispatch:edit:{order.id}")],

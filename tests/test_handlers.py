@@ -1,22 +1,27 @@
 import unittest
+from datetime import date, datetime, timedelta, timezone
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 from handlers.admin import assign_role, change_staff_role, disable_staff, start, admin_cancel_order
 from database.models import Order, User
 from database.session import create_database, initialize_database
-from handlers.common import DatabaseMiddleware, ROLE_COURIER
-from handlers.courier import update_order_status
+from handlers.common import DatabaseMiddleware, ROLE_COURIER, send_order_card
+from handlers.courier import end_shift, save_location, show_tasks, update_order_status
 from handlers.dispatcher import (
     OrderForm,
+    begin_edit,
     choose_address_type,
     confirm_address,
+    cancel_order,
     set_address,
     set_address_details,
     set_pickup_day,
 )
-from handlers.laundry import cancel_laundry_flow
-from main import create_dispatcher
+from handlers.fallback import ROLE_HELP
+from handlers.laundry import cancel_laundry_flow, mark_ready, save_measurement, show_order
+from main import USER_ERROR_MESSAGE, create_dispatcher, handle_unhandled_error
+from utils.dates import bishkek_today
 
 
 class MemoryFSM:
@@ -123,6 +128,10 @@ class HandlerRegressionTests(unittest.IsolatedAsyncioTestCase):
                 )
                 order = await db.get(Order, 1)
                 self.assertEqual(order.address, address)
+                self.assertEqual(
+                    order.pickup_day,
+                    (bishkek_today() + timedelta(days=1)).strftime("%d.%m.%Y"),
+                )
                 self.assertEqual(order.latitude, 42.8)
                 self.assertEqual(order.longitude, 74.6)
         finally:
@@ -152,7 +161,21 @@ class HandlerRegressionTests(unittest.IsolatedAsyncioTestCase):
                     longitude=74.6,
                 )
                 order = Order(client_name="Client", address="Street 1", pickup_day="Сегодня")
-                db.add_all([staff, order])
+                pickup_order = Order(
+                    client_name="Pickup",
+                    address="Street 2",
+                    pickup_day="Сегодня",
+                    status="pickup_en_route",
+                    pickup_courier_id=52,
+                )
+                delivery_order = Order(
+                    client_name="Delivery",
+                    address="Street 3",
+                    pickup_day="Сегодня",
+                    status="delivery_en_route",
+                    delivery_courier_id=52,
+                )
+                db.add_all([staff, order, pickup_order, delivery_order])
                 await db.commit()
                 bot = SimpleNamespace(send_message=AsyncMock())
                 settings = SimpleNamespace(admin_ids=frozenset({1}))
@@ -183,6 +206,10 @@ class HandlerRegressionTests(unittest.IsolatedAsyncioTestCase):
                 self.assertFalse(staff.is_on_shift)
                 self.assertIsNone(staff.latitude)
                 self.assertIsNone(staff.longitude)
+                self.assertEqual(pickup_order.status, "new")
+                self.assertIsNone(pickup_order.pickup_courier_id)
+                self.assertEqual(delivery_order.status, "ready")
+                self.assertIsNone(delivery_order.delivery_courier_id)
 
                 await admin_cancel_order(
                     make_callback(f"admin:order:cancel:{order.id}"),
@@ -203,7 +230,7 @@ class HandlerRegressionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(message.answer.await_args.args[0], "Действие отменено.")
         self.assertIsNotNone(message.answer.await_args.kwargs["reply_markup"])
 
-    async def test_start_resends_request_for_pending_user(self):
+    async def test_start_does_not_resend_request_for_existing_pending_user(self):
         user = SimpleNamespace(is_approved=False)
         db = SimpleNamespace(get=AsyncMock(return_value=user))
         bot = SimpleNamespace(send_message=AsyncMock())
@@ -215,8 +242,8 @@ class HandlerRegressionTests(unittest.IsolatedAsyncioTestCase):
 
         await start(message, db, bot, settings, user_role=None)
 
-        self.assertEqual(bot.send_message.await_count, 2)
-        self.assertIn("Дождитесь назначения роли", message.answer.await_args.args[0])
+        bot.send_message.assert_not_awaited()
+        self.assertEqual(message.answer.await_args.args[0], "Запрос уже отправлен, ожидайте.")
 
     async def test_stale_admin_approval_cannot_change_assigned_role(self):
         user = SimpleNamespace(is_approved=True, role=ROLE_COURIER)
@@ -394,6 +421,277 @@ class HandlerRegressionTests(unittest.IsolatedAsyncioTestCase):
                 )
         finally:
             await engine.dispose()
+
+    async def test_delivery_claim_assigns_an_unassigned_ready_order(self):
+        engine, session_factory = create_database("sqlite+aiosqlite:///:memory:")
+        try:
+            await initialize_database(engine)
+            async with session_factory() as db:
+                courier = User(
+                    telegram_id=101,
+                    full_name="Courier",
+                    role=ROLE_COURIER,
+                    is_approved=True,
+                    is_on_shift=True,
+                )
+                order = Order(
+                    client_name="Client",
+                    address="Street 1",
+                    pickup_day="17.10.2026",
+                    status="ready",
+                )
+                db.add_all([courier, order])
+                await db.commit()
+                callback = SimpleNamespace(
+                    from_user=SimpleNamespace(id=101),
+                    data=f"courier:delivery:{order.id}",
+                    answer=AsyncMock(),
+                    message=SimpleNamespace(edit_text=AsyncMock()),
+                )
+
+                await update_order_status(callback, db)
+
+                self.assertEqual(order.status, "delivery_en_route")
+                self.assertEqual(order.delivery_courier_id, 101)
+        finally:
+            await engine.dispose()
+
+    async def test_live_location_after_shift_is_silently_ignored(self):
+        user = SimpleNamespace(is_on_shift=False)
+        db = SimpleNamespace(get=AsyncMock(return_value=user), commit=AsyncMock())
+        message = SimpleNamespace(
+            from_user=SimpleNamespace(id=101),
+            location=SimpleNamespace(latitude=42.8, longitude=74.6),
+            answer=AsyncMock(),
+        )
+
+        await save_location(message, db, notify=False)
+
+        message.answer.assert_not_awaited()
+        db.commit.assert_not_awaited()
+
+    async def test_end_shift_warns_about_assigned_active_orders(self):
+        engine, session_factory = create_database("sqlite+aiosqlite:///:memory:")
+        try:
+            await initialize_database(engine)
+            async with session_factory() as db:
+                courier = User(
+                    telegram_id=101,
+                    full_name="Courier",
+                    role=ROLE_COURIER,
+                    is_approved=True,
+                    is_on_shift=True,
+                )
+                order = Order(
+                    client_name="Client",
+                    address="Street 1",
+                    pickup_day="17.10.2026",
+                    status="delivery_en_route",
+                    delivery_courier_id=101,
+                )
+                db.add_all([courier, order])
+                await db.commit()
+                message = SimpleNamespace(
+                    from_user=SimpleNamespace(id=101),
+                    answer=AsyncMock(),
+                )
+
+                await end_shift(message, db)
+
+                self.assertFalse(courier.is_on_shift)
+                self.assertIn("активных заказов: 1", message.answer.await_args.args[0])
+        finally:
+            await engine.dispose()
+
+    async def test_tasks_hide_future_pickups_and_use_longitude_first_2gis_url(self):
+        today = date(2026, 10, 17)
+        due_order = SimpleNamespace(
+            id=1,
+            status="new",
+            pickup_day="17.10.2026",
+            pickup_courier_id=None,
+            delivery_courier_id=None,
+            client_name="Due",
+            address="Street 1",
+            latitude=42.8,
+            longitude=74.6,
+        )
+        future_order = SimpleNamespace(
+            id=2,
+            status="new",
+            pickup_day="24.10.2026",
+            pickup_courier_id=None,
+            delivery_courier_id=None,
+            client_name="Future",
+            address="Street 2",
+            latitude=42.9,
+            longitude=74.7,
+        )
+        db = SimpleNamespace(scalars=AsyncMock(return_value=SimpleNamespace(all=lambda: [due_order, future_order])))
+        courier = SimpleNamespace(telegram_id=101, latitude=42.7, longitude=74.5)
+        message = SimpleNamespace(answer=AsyncMock())
+
+        with patch("handlers.courier.bishkek_today", return_value=today):
+            await show_tasks(message, db, courier)
+
+        self.assertEqual(message.answer.await_count, 1)
+        task_message = message.answer.await_args
+        self.assertIn("Заказ #1", task_message.args[0])
+        self.assertNotIn("Заказ #2", task_message.args[0])
+        buttons = task_message.kwargs["reply_markup"].inline_keyboard
+        self.assertEqual(buttons[0][0].url, "https://2gis.kg/bishkek/geo/74.6,42.8")
+
+    async def test_dispatcher_can_only_edit_or_cancel_new_orders(self):
+        engine, session_factory = create_database("sqlite+aiosqlite:///:memory:")
+        try:
+            await initialize_database(engine)
+            async with session_factory() as db:
+                order = Order(
+                    client_name="Client",
+                    address="Street 1",
+                    pickup_day="17.10.2026",
+                    status="pickup_en_route",
+                )
+                db.add(order)
+                await db.commit()
+                state = MemoryFSM(None, {})
+                edit_callback = SimpleNamespace(
+                    data=f"dispatch:edit:{order.id}",
+                    answer=AsyncMock(),
+                    message=SimpleNamespace(answer=AsyncMock()),
+                )
+                cancel_callback = SimpleNamespace(
+                    data=f"dispatch:cancel:{order.id}",
+                    answer=AsyncMock(),
+                    message=SimpleNamespace(edit_text=AsyncMock()),
+                )
+
+                await begin_edit(edit_callback, state, db)
+                await cancel_order(cancel_callback, db)
+
+                edit_callback.answer.assert_awaited_once_with("Изменять можно только новый заказ.", show_alert=True)
+                cancel_callback.answer.assert_awaited_once_with("Отменить можно только новый заказ.", show_alert=True)
+                await db.refresh(order)
+                self.assertEqual(order.status, "pickup_en_route")
+        finally:
+            await engine.dispose()
+
+    async def test_closed_dispatcher_order_cards_have_no_action_buttons(self):
+        for status in ("delivered", "cancelled"):
+            message = SimpleNamespace(answer=AsyncMock())
+            order = SimpleNamespace(
+                id=12,
+                client_name="Client",
+                address="Street 1",
+                pickup_day="17.10.2026",
+                status=status,
+                created_at=datetime(2026, 10, 17, 12, tzinfo=timezone.utc),
+                measurements=None,
+            )
+            with self.subTest(status=status):
+                await send_order_card(message, order, show_dispatcher_actions=True)
+                self.assertIsNone(message.answer.await_args.kwargs.get("reply_markup"))
+
+    async def test_laundry_status_writes_are_atomic_and_race_safe(self):
+        engine, session_factory = create_database("sqlite+aiosqlite:///:memory:")
+        try:
+            await initialize_database(engine)
+            async with session_factory() as db:
+                order = Order(
+                    client_name="Client",
+                    address="Street 1",
+                    pickup_day="17.10.2026",
+                    status="picked_up",
+                )
+                db.add(order)
+                await db.commit()
+                state = MemoryFSM("LaundryForm:measurements", {"order_id": order.id})
+                message = SimpleNamespace(text="Ковёр 3x4", answer=AsyncMock())
+
+                await save_measurement(message, state, db)
+                await db.refresh(order)
+                self.assertEqual(order.status, "processing")
+                self.assertEqual(order.measurements, "Ковёр 3x4")
+
+                callback = SimpleNamespace(
+                    data=f"laundry:ready:{order.id}",
+                    answer=AsyncMock(),
+                    message=SimpleNamespace(edit_text=AsyncMock()),
+                )
+                await mark_ready(callback, db)
+                self.assertEqual(order.status, "ready")
+
+                stale_state = MemoryFSM("LaundryForm:measurements", {"order_id": order.id})
+                stale_message = SimpleNamespace(text="Повторные замеры", answer=AsyncMock())
+                await save_measurement(stale_message, stale_state, db)
+                stale_message.answer.assert_awaited_once_with("Заказ уже недоступен для изменения.")
+                self.assertIsNone(await stale_state.get_state())
+                await db.refresh(order)
+                self.assertEqual(order.measurements, "Ковёр 3x4")
+
+                repeated_callback = SimpleNamespace(
+                    data=f"laundry:ready:{order.id}",
+                    answer=AsyncMock(),
+                    message=None,
+                )
+                await mark_ready(repeated_callback, db)
+                repeated_callback.answer.assert_awaited_once_with(
+                    "Заказ не найден или его статус уже изменился.",
+                    show_alert=True,
+                )
+                await db.refresh(order)
+                self.assertEqual(order.status, "ready")
+        finally:
+            await engine.dispose()
+
+    async def test_laundry_uses_human_readable_order_status(self):
+        order = SimpleNamespace(
+            id=12,
+            status="new",
+        )
+        db = SimpleNamespace(get=AsyncMock(return_value=order))
+        message = SimpleNamespace(answer=AsyncMock())
+
+        await show_order(message, db, "12")
+
+        self.assertIn("статус: Новый", message.answer.await_args.args[0])
+
+    async def test_admin_help_mentions_panel_sections(self):
+        self.assertIn("/admin", ROLE_HELP["super_admin"])
+        for section in ("Сотрудники", "Заявки", "Статистика", "Заказы"):
+            self.assertIn(section, ROLE_HELP["super_admin"])
+
+    async def test_first_start_sends_access_request_once(self):
+        db = SimpleNamespace(get=AsyncMock(return_value=None), add=Mock(), commit=AsyncMock())
+        bot = SimpleNamespace(send_message=AsyncMock())
+        message = SimpleNamespace(
+            from_user=SimpleNamespace(id=52, full_name="Staff Member", username="staff"),
+            answer=AsyncMock(),
+        )
+        settings = SimpleNamespace(admin_ids=frozenset({1, 2}))
+
+        await start(message, db, bot, settings, user_role=None)
+
+        self.assertEqual(bot.send_message.await_count, 2)
+
+    async def test_global_error_handler_answers_callback_and_message(self):
+        callback = SimpleNamespace(answer=AsyncMock())
+        callback_event = SimpleNamespace(
+            exception=RuntimeError("callback failure"),
+            update=SimpleNamespace(callback_query=callback, message=None, edited_message=None),
+        )
+        with self.assertLogs("main", level="ERROR"):
+            await handle_unhandled_error(callback_event)
+        callback.answer.assert_awaited_once_with(USER_ERROR_MESSAGE, show_alert=True)
+
+        message = SimpleNamespace(answer=AsyncMock())
+        message_event = SimpleNamespace(
+            exception=RuntimeError("message failure"),
+            update=SimpleNamespace(callback_query=None, message=message, edited_message=None),
+        )
+        with self.assertLogs("main", level="ERROR"):
+            await handle_unhandled_error(message_event)
+        message.answer.assert_awaited_once_with(USER_ERROR_MESSAGE)
 
 
 if __name__ == "__main__":

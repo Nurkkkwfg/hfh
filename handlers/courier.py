@@ -1,10 +1,11 @@
 from aiogram import F, Router
 from aiogram.filters import Command
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton, Message, ReplyKeyboardMarkup
-from sqlalchemy import select, update
+from sqlalchemy import func, select, update
 
 from database.models import Order, User
 from handlers.common import ROLE_COURIER, RoleFilter, role_keyboard, status_label
+from utils.dates import bishkek_today, parse_pickup_day
 from utils.geo import haversine_km, sort_orders_by_distance
 
 router = Router(name="courier")
@@ -45,11 +46,22 @@ async def end_shift(message: Message, db):
     if user is None:
         await message.answer("Учётная запись не найдена. Обратитесь к администратору.")
         return
+    active_count = await db.scalar(
+        select(func.count())
+        .select_from(Order)
+        .where(
+            (Order.status == "pickup_en_route") & (Order.pickup_courier_id == user.telegram_id)
+            | (Order.status == "delivery_en_route") & (Order.delivery_courier_id == user.telegram_id)
+        )
+    )
     user.is_on_shift = False
     user.latitude = None
     user.longitude = None
     await db.commit()
-    await message.answer("Смена завершена.", reply_markup=role_keyboard(ROLE_COURIER))
+    text = "Смена завершена."
+    if active_count:
+        text += f" Внимание: за вами закреплено активных заказов: {active_count}. Завершите их при следующем выходе на смену."
+    await message.answer(text, reply_markup=role_keyboard(ROLE_COURIER))
 
 
 async def save_location(message: Message, db, *, notify: bool = True):
@@ -57,6 +69,8 @@ async def save_location(message: Message, db, *, notify: bool = True):
         return
     user = await db.get(User, message.from_user.id)
     if user is None or not user.is_on_shift:
+        if not notify:
+            return
         await message.answer("Сначала начните смену.")
         return
     user.latitude, user.longitude = message.location.latitude, message.location.longitude
@@ -97,14 +111,20 @@ async def show_tasks(message: Message, db, courier: User):
             )
         )
     ).all()
-    available = [
-        order
-        for order in orders
-        if order.status == "new"
-        or (order.status == "pickup_en_route" and order.pickup_courier_id == courier.telegram_id)
-        or order.status == "ready"
-        or (order.status == "delivery_en_route" and order.delivery_courier_id == courier.telegram_id)
-    ]
+    current_date = bishkek_today()
+    available = []
+    for order in orders:
+        if order.status == "new":
+            pickup_date = parse_pickup_day(order.pickup_day)
+            if pickup_date is None or pickup_date > current_date:
+                continue
+        elif order.status == "pickup_en_route" and order.pickup_courier_id != courier.telegram_id:
+            continue
+        elif order.status == "delivery_en_route" and order.delivery_courier_id != courier.telegram_id:
+            continue
+        elif order.status not in {"pickup_en_route", "ready", "delivery_en_route"}:
+            continue
+        available.append(order)
     available = sort_orders_by_distance(available, courier.latitude, courier.longitude)
     if not available:
         await message.answer("Открытых задач нет.")
@@ -124,7 +144,7 @@ async def show_tasks(message: Message, db, courier: User):
             buttons.append(
                 [InlineKeyboardButton(
                     text="🗺 Открыть в 2GIS",
-                    url=f"https://2gis.kg/bishkek/search/{order.latitude},{order.longitude}",
+                    url=f"https://2gis.kg/bishkek/geo/{order.longitude},{order.latitude}",
                 )]
             )
         action = {
@@ -164,7 +184,11 @@ async def update_order_status(callback: CallbackQuery, db):
         return
     owner_field = transition[2]
     owner_column = getattr(Order, owner_field)
-    owner_condition = owner_column.is_(None) if action == "courier:pickup" else owner_column == courier_id
+    owner_condition = (
+        owner_column.is_(None)
+        if action in {"courier:pickup", "courier:delivery"}
+        else owner_column == courier_id
+    )
     result = await db.execute(
         update(Order)
         .where(Order.id == order_id, Order.status == transition[0], owner_condition)
