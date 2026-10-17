@@ -1,7 +1,7 @@
 from aiogram import F, Router
 from aiogram.filters import Command
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton, Message, ReplyKeyboardMarkup
-from sqlalchemy import select
+from sqlalchemy import select, update
 
 from database.models import Order, User
 from handlers.common import ROLE_COURIER, RoleFilter, role_keyboard, status_label
@@ -16,7 +16,12 @@ router.callback_query.filter(RoleFilter(ROLE_COURIER))
 @router.message(F.text == "🟢 Начать смену")
 async def start_shift(message: Message, db):
     user = await db.get(User, message.from_user.id)
+    if user is None:
+        await message.answer("Учётная запись не найдена. Обратитесь к администратору.")
+        return
     user.is_on_shift = True
+    user.latitude = None
+    user.longitude = None
     await db.commit()
     keyboard = ReplyKeyboardMarkup(
         keyboard=[
@@ -37,7 +42,12 @@ async def start_shift(message: Message, db):
 @router.message(F.text == "🔴 Завершить смену")
 async def end_shift(message: Message, db):
     user = await db.get(User, message.from_user.id)
+    if user is None:
+        await message.answer("Учётная запись не найдена. Обратитесь к администратору.")
+        return
     user.is_on_shift = False
+    user.latitude = None
+    user.longitude = None
     await db.commit()
     await message.answer("Смена завершена.", reply_markup=role_keyboard(ROLE_COURIER))
 
@@ -70,8 +80,11 @@ async def receive_live_location_update(message: Message, db):
 @router.message(F.text == "📋 Мои задачи")
 async def tasks(message: Message, db):
     user = await db.get(User, message.from_user.id)
+    if not user or not user.is_on_shift:
+        await message.answer("Сначала начните смену.")
+        return
     if user.latitude is None or user.longitude is None:
-        await message.answer("Сначала отправьте геопозицию после начала смены.")
+        await message.answer("Отправьте текущую геопозицию после начала смены.")
         return
     await show_tasks(message, db, user)
 
@@ -133,12 +146,12 @@ async def update_order_status(callback: CallbackQuery, db):
     except (AttributeError, ValueError):
         await callback.answer("Некорректная задача.", show_alert=True)
         return
-    order = await db.get(Order, order_id)
-    if order is None:
-        await callback.answer("Заказ не найден.", show_alert=True)
+    courier_id = callback.from_user.id
+    courier = await db.get(User, courier_id)
+    if courier is None or not courier.is_on_shift:
+        await callback.answer("Смена не активна. Начните смену перед обновлением заказа.", show_alert=True)
         return
 
-    courier_id = callback.from_user.id
     transitions = {
         "courier:pickup": ("new", "pickup_en_route", "pickup_courier_id"),
         "courier:picked": ("pickup_en_route", "picked_up", "pickup_courier_id"),
@@ -146,17 +159,22 @@ async def update_order_status(callback: CallbackQuery, db):
         "courier:delivered": ("delivery_en_route", "delivered", "delivery_courier_id"),
     }
     transition = transitions.get(action)
-    if transition is None or order.status != transition[0]:
+    if transition is None:
         await callback.answer("Статус уже изменён или задача недоступна.", show_alert=True)
         return
     owner_field = transition[2]
-    owner_id = getattr(order, owner_field)
-    if owner_id is not None and owner_id != courier_id:
-        await callback.answer("Эта задача закреплена за другим курьером.", show_alert=True)
+    owner_column = getattr(Order, owner_field)
+    owner_condition = owner_column.is_(None) if action == "courier:pickup" else owner_column == courier_id
+    result = await db.execute(
+        update(Order)
+        .where(Order.id == order_id, Order.status == transition[0], owner_condition)
+        .values(status=transition[1], **{owner_field: courier_id})
+    )
+    if result.rowcount != 1:
+        await db.rollback()
+        await callback.answer("Задача уже изменена или закреплена за другим курьером.", show_alert=True)
         return
-    setattr(order, owner_field, courier_id)
-    order.status = transition[1]
     await db.commit()
     await callback.answer("Статус заказа обновлён.")
     if callback.message:
-        await callback.message.edit_text(f"Заказ #{order.id}: {status_label(order.status)}")
+        await callback.message.edit_text(f"Заказ #{order_id}: {status_label(transition[1])}")

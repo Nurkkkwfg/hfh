@@ -5,7 +5,7 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
 from database.models import Order
-from handlers.common import ROLE_LAUNDRY, RoleFilter, status_label
+from handlers.common import ROLE_LAUNDRY, RoleFilter, role_keyboard, status_label
 
 router = Router(name="laundry")
 router.message.filter(RoleFilter(ROLE_LAUNDRY))
@@ -31,7 +31,7 @@ async def cancel_laundry_flow(message: Message, state: FSMContext):
         await message.answer("Сейчас нет незавершённого действия.")
         return
     await state.clear()
-    await message.answer("Действие отменено.", reply_markup=ReplyKeyboardRemove())
+    await message.answer("Действие отменено.", reply_markup=role_keyboard(ROLE_LAUNDRY))
 
 
 @router.message(Command("order"))

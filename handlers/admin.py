@@ -1,7 +1,7 @@
 from aiogram import Bot, F, Router
 from aiogram.filters import Command, CommandStart
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
-from sqlalchemy import select
+from sqlalchemy import select, update
 
 from config import Settings
 from database.models import User
@@ -114,7 +114,15 @@ async def assign_role(callback: CallbackQuery, db, bot: Bot, settings: Settings)
     if user.is_approved:
         await callback.answer("Пользователь уже одобрен.", show_alert=True)
         return
-    user.role, user.is_approved = role, True
+    result = await db.execute(
+        update(User)
+        .where(User.telegram_id == user_id, User.is_approved.is_(False))
+        .values(role=role, is_approved=True)
+    )
+    if result.rowcount != 1:
+        await db.rollback()
+        await callback.answer("Пользователь уже одобрен.", show_alert=True)
+        return
     await db.commit()
     await callback.answer("Роль назначена.")
     if callback.message:
