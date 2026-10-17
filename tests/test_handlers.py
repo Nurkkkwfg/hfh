@@ -1,17 +1,133 @@
 import unittest
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 from handlers.admin import assign_role, change_staff_role, disable_staff, start, admin_cancel_order
 from database.models import Order, User
 from database.session import create_database, initialize_database
 from handlers.common import DatabaseMiddleware, ROLE_COURIER
 from handlers.courier import update_order_status
+from handlers.dispatcher import (
+    OrderForm,
+    choose_address_type,
+    confirm_address,
+    set_address,
+    set_address_details,
+    set_pickup_day,
+)
 from handlers.laundry import cancel_laundry_flow
 from main import create_dispatcher
 
 
+class MemoryFSM:
+    def __init__(self, current_state, data):
+        self.current_state = current_state
+        self.data = data
+
+    async def get_state(self):
+        return self.current_state
+
+    async def set_state(self, state):
+        self.current_state = state.state
+
+    async def update_data(self, **kwargs):
+        self.data.update(kwargs)
+
+    async def get_data(self):
+        return self.data
+
+    async def clear(self):
+        self.current_state = None
+        self.data.clear()
+
+
 class HandlerRegressionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_address_search_confirmation_and_apartment_details(self):
+        state = MemoryFSM(OrderForm.address.state, {"address_flow": "create"})
+        message = SimpleNamespace(text="улица Киевская, 10", answer=AsyncMock())
+
+        await set_address(message, state)
+
+        self.assertEqual(state.current_state, OrderForm.address_confirm.state)
+        markup = message.answer.await_args.kwargs["reply_markup"]
+        search_button = markup.inline_keyboard[0][0]
+        self.assertEqual(search_button.text, "🔎 Проверить адрес в 2ГИС")
+        self.assertIn("2gis.kg/bishkek/search/", search_button.url)
+        self.assertEqual(markup.inline_keyboard[1][0].callback_data, "dispatch:address:confirm")
+
+        callback = SimpleNamespace(
+            data="dispatch:address:confirm",
+            answer=AsyncMock(),
+            message=SimpleNamespace(answer=AsyncMock()),
+        )
+        await confirm_address(callback, state)
+        self.assertEqual(state.current_state, OrderForm.address_type.state)
+
+        callback.data = "dispatch:address:type:apartment"
+        await choose_address_type(callback, state, db=None, settings=None)
+        self.assertEqual(state.current_state, OrderForm.address_details.state)
+
+        details_message = SimpleNamespace(text="подъезд 2, этаж 4, квартира 15", answer=AsyncMock())
+        await set_address_details(details_message, state, db=None, settings=None)
+        self.assertEqual(state.data["address"], "улица Киевская, 10, подъезд 2, этаж 4, квартира 15")
+        self.assertEqual(state.current_state, OrderForm.pickup_day.state)
+        self.assertIn("Адрес сохранён", details_message.answer.await_args.args[0])
+
+    async def test_private_house_address_does_not_request_apartment_details(self):
+        state = MemoryFSM(
+            OrderForm.address_type.state,
+            {"address_flow": "create", "address_base": "улица Садовая, 5"},
+        )
+        callback = SimpleNamespace(
+            data="dispatch:address:type:house",
+            answer=AsyncMock(),
+            message=SimpleNamespace(answer=AsyncMock()),
+        )
+
+        await choose_address_type(callback, state, db=None, settings=None)
+
+        self.assertEqual(state.data["address"], "улица Садовая, 5 (частный дом)")
+        self.assertEqual(state.current_state, OrderForm.pickup_day.state)
+        self.assertIn("Когда забрать", callback.message.answer.await_args.args[0])
+
+    async def test_created_order_keeps_apartment_details_but_geocodes_building_address(self):
+        engine, session_factory = create_database("sqlite+aiosqlite:///:memory:")
+        try:
+            await initialize_database(engine)
+            async with session_factory() as db:
+                address = "улица Киевская, 10, подъезд 2, этаж 4, квартира 15"
+                state = MemoryFSM(
+                    OrderForm.pickup_day.state,
+                    {
+                        "client_name": "Client",
+                        "address_base": "улица Киевская, 10",
+                        "address": address,
+                    },
+                )
+                message = SimpleNamespace(text="Завтра", answer=AsyncMock())
+                settings = SimpleNamespace(
+                    geocoder_url="https://example.test",
+                    geocoder_user_agent="test",
+                )
+                with patch(
+                    "handlers.dispatcher.geocode_bishkek_address",
+                    new_callable=AsyncMock,
+                    return_value=(42.8, 74.6),
+                ) as geocode:
+                    await set_pickup_day(message, state, db, settings)
+
+                geocode.assert_awaited_once_with(
+                    "улица Киевская, 10",
+                    "https://example.test",
+                    "test",
+                )
+                order = await db.get(Order, 1)
+                self.assertEqual(order.address, address)
+                self.assertEqual(order.latitude, 42.8)
+                self.assertEqual(order.longitude, 74.6)
+        finally:
+            await engine.dispose()
+
     async def test_database_middleware_is_outermost_for_every_update_type(self):
         settings = SimpleNamespace(admin_ids=frozenset({1}))
         dispatcher = create_dispatcher(settings, session_factory=None)
