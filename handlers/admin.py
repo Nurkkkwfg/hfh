@@ -17,7 +17,7 @@ from handlers.common import (
     role_keyboard,
     status_label,
 )
-from utils.dates import format_bishkek_datetime
+from utils.dates import format_bishkek_datetime, format_pickup_date
 
 router = Router(name="admin")
 logger = logging.getLogger(__name__)
@@ -209,7 +209,8 @@ async def admin_orders(message: Message, db, settings: Settings):
     for order in orders:
         text = (
             f"Заказ #{order.id}\nКлиент: {order.client_name}\nАдрес: {order.address}\n"
-            f"Забор: {order.pickup_day}\nСтатус: {status_label(order.status)}\n"
+            f"Забор: {format_pickup_date(order.pickup_date)} {order.pickup_slot}\n"
+            f"Статус: {status_label(order.status)}\n"
             f"Создан: {format_bishkek_datetime(order.created_at)}"
         )
         keyboard = None

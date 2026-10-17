@@ -1,16 +1,23 @@
 from aiogram import F, Router
 from aiogram.filters import Command
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton, Message, ReplyKeyboardMarkup
 from sqlalchemy import func, select, update
 
-from database.models import Order, User
+from database.models import Order, OrderEvent, User
 from handlers.common import ROLE_COURIER, RoleFilter, role_keyboard, status_label
-from utils.dates import bishkek_today, parse_pickup_day
+from utils.dates import bishkek_today, format_pickup_date, parse_pickup_day
 from utils.geo import haversine_km, sort_orders_by_distance
+from utils.notify import notify_dispatchers, notify_order_status
 
 router = Router(name="courier")
 router.message.filter(RoleFilter(ROLE_COURIER))
 router.callback_query.filter(RoleFilter(ROLE_COURIER))
+
+
+class CourierProblem(StatesGroup):
+    reason = State()
 
 
 @router.message(Command("shift"))
@@ -115,7 +122,9 @@ async def show_tasks(message: Message, db, courier: User):
     available = []
     for order in orders:
         if order.status == "new":
-            pickup_date = parse_pickup_day(order.pickup_day)
+            pickup_date = getattr(order, "pickup_date", None)
+            if pickup_date is None:
+                pickup_date = parse_pickup_day(getattr(order, "pickup_day", ""))
             if pickup_date is None or pickup_date > current_date:
                 continue
         elif order.status == "pickup_en_route" and order.pickup_courier_id != courier.telegram_id:
@@ -137,7 +146,9 @@ async def show_tasks(message: Message, db, courier: User):
         )
         text = (
             f"Заказ #{order.id}\nКлиент: {order.client_name}\nАдрес: {order.address}\n"
-            f"Забор: {order.pickup_day}\nСтатус: {status_label(order.status)}\nДо адреса: {distance}"
+            f"Забор: {format_pickup_date(pickup_date if order.status == 'new' else getattr(order, 'pickup_date', bishkek_today()))} "
+            f"{getattr(order, 'pickup_slot', 'Любое')}\n"
+            f"Статус: {status_label(order.status)}\nДо адреса: {distance}"
         )
         buttons = []
         if order.latitude is not None and order.longitude is not None:
@@ -155,10 +166,16 @@ async def show_tasks(message: Message, db, courier: User):
         }.get(order.status)
         if action:
             buttons.append([InlineKeyboardButton(text=action[0], callback_data=f"{action[1]}{order.id}")])
+        if (
+            order.status == "pickup_en_route" and order.pickup_courier_id == courier.telegram_id
+        ) or (
+            order.status == "delivery_en_route" and order.delivery_courier_id == courier.telegram_id
+        ):
+            buttons.append([InlineKeyboardButton(text="⚠️ Проблема", callback_data=f"courier:problem:{order.id}")])
         await message.answer(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
 
 
-@router.callback_query(F.data.startswith("courier:"))
+@router.callback_query(F.data.regexp(r"^courier:(pickup|picked|delivery|delivered):\d+$"))
 async def update_order_status(callback: CallbackQuery, db):
     try:
         action, order_id_raw = callback.data.rsplit(":", 1)
@@ -202,7 +219,182 @@ async def update_order_status(callback: CallbackQuery, db):
     if order is not None:
         order.status = transition[1]
         setattr(order, owner_field, courier_id)
+        db.add(
+            OrderEvent(
+                order_id=order.id,
+                actor_id=courier_id,
+                actor_name=courier.full_name,
+                from_status=transition[0],
+                to_status=transition[1],
+            )
+        )
     await db.commit()
+    if transition[1] == "delivered" and order is not None:
+        await notify_order_status(
+            callback.bot,
+            db,
+            order,
+            status="delivered",
+            unpaid=not order.is_paid,
+        )
     await callback.answer("Статус заказа обновлён.")
     if callback.message:
         await callback.message.edit_text(f"Заказ #{order_id}: {status_label(transition[1])}")
+
+
+@router.callback_query(F.data.startswith("courier:open:"))
+async def open_notified_order(callback: CallbackQuery, db):
+    try:
+        order_id = int(callback.data.rsplit(":", 1)[1])
+    except ValueError:
+        await callback.answer("Некорректный заказ.", show_alert=True)
+        return
+    order = await db.get(Order, order_id)
+    if order is None or order.status not in {"new", "pickup_en_route", "ready", "delivery_en_route"}:
+        await callback.answer("Заказ больше недоступен.", show_alert=True)
+        return
+    if order.status == "pickup_en_route" and order.pickup_courier_id != callback.from_user.id:
+        await callback.answer("Заказ закреплён за другим курьером.", show_alert=True)
+        return
+    if order.status == "delivery_en_route" and order.delivery_courier_id != callback.from_user.id:
+        await callback.answer("Заказ закреплён за другим курьером.", show_alert=True)
+        return
+    courier = await db.get(User, callback.from_user.id)
+    if courier is None:
+        await callback.answer("Профиль курьера не найден.", show_alert=True)
+        return
+    if callback.message:
+        if courier.is_on_shift and courier.latitude is not None and courier.longitude is not None:
+            await show_tasks(callback.message, db, courier)
+        else:
+            action = {
+                "new": ("🛻 Выехал за заказом", f"courier:pickup:{order.id}"),
+                "pickup_en_route": ("Открыть заказ", f"courier:picked:{order.id}"),
+                "ready": ("🚚 Выехал на доставку", f"courier:delivery:{order.id}"),
+                "delivery_en_route": ("✅ Доставлено", f"courier:delivered:{order.id}"),
+            }.get(order.status)
+            markup = (
+                InlineKeyboardMarkup(
+                    inline_keyboard=[
+                        [InlineKeyboardButton(text=action[0], callback_data=action[1])]
+                    ]
+                )
+                if action
+                else None
+            )
+            await callback.message.answer(
+                f"Заказ #{order.id}\nКлиент: {order.client_name}\nАдрес: {order.address}\n"
+                f"Забор: {format_pickup_date(order.pickup_date)} {order.pickup_slot}",
+                reply_markup=markup,
+            )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("courier:decline:"))
+async def decline_assigned_order(callback: CallbackQuery, db):
+    try:
+        order_id = int(callback.data.rsplit(":", 1)[1])
+    except ValueError:
+        await callback.answer("Некорректный заказ.", show_alert=True)
+        return
+    order = await db.get(Order, order_id)
+    if order is None:
+        await callback.answer("Заказ не найден.", show_alert=True)
+        return
+    result = await db.execute(
+        update(Order)
+        .where(
+            Order.id == order_id,
+            Order.status == "pickup_en_route",
+            Order.pickup_courier_id == callback.from_user.id,
+        )
+        .values(status="new", pickup_courier_id=None)
+    )
+    if result.rowcount != 1:
+        await db.rollback()
+        await callback.answer("Заказ уже изменён или принадлежит другому курьеру.", show_alert=True)
+        return
+    courier = await db.get(User, callback.from_user.id)
+    db.add(
+        OrderEvent(
+            order_id=order_id,
+            actor_id=callback.from_user.id,
+            actor_name=courier.full_name if courier else "Курьер",
+            from_status="pickup_en_route",
+            to_status="new",
+            note="Курьер отказался от заказа",
+        )
+    )
+    await db.commit()
+    await notify_dispatchers(callback.bot, db, f"Курьер отказался от заказа #{order_id}.")
+    await callback.answer("Заказ возвращён в очередь.")
+
+
+@router.callback_query(F.data.startswith("courier:problem:"))
+async def ask_problem_reason(callback: CallbackQuery, state: FSMContext):
+    order_id = int(callback.data.rsplit(":", 1)[1])
+    await state.set_state(CourierProblem.reason)
+    await state.update_data(problem_order_id=order_id)
+    if callback.message:
+        await callback.message.answer("Опишите проблему с заказом:")
+    await callback.answer()
+
+
+@router.message(CourierProblem.reason)
+async def save_problem_reason(message: Message, state: FSMContext, db):
+    reason = (message.text or "").strip()
+    if not reason:
+        await message.answer("Укажите причину текстом:")
+        return
+    data = await state.get_data()
+    order_id = data.get("problem_order_id")
+    order = await db.get(Order, order_id) if order_id else None
+    courier = await db.get(User, message.from_user.id)
+    if order is None or courier is None:
+        await state.clear()
+        await message.answer("Заказ или профиль курьера не найден.")
+        return
+    if order.pickup_courier_id != courier.telegram_id and order.delivery_courier_id != courier.telegram_id:
+        await state.clear()
+        await message.answer("Этот заказ вам не назначен.")
+        return
+    old_status = order.status
+    failed_status = "pickup_failed" if old_status == "pickup_en_route" else "delivery_failed"
+    owner_column = Order.pickup_courier_id if old_status == "pickup_en_route" else Order.delivery_courier_id
+    result = await db.execute(
+        update(Order)
+        .where(
+            Order.id == order.id,
+            Order.status == old_status,
+            owner_column == courier.telegram_id,
+        )
+        .values(status=failed_status)
+    )
+    if result.rowcount != 1:
+        await db.rollback()
+        await state.clear()
+        await message.answer("Статус заказа уже изменился. Обновите задачи.")
+        return
+    db.add(
+        OrderEvent(
+            order_id=order.id,
+            actor_id=courier.telegram_id,
+            actor_name=courier.full_name,
+            from_status=old_status,
+            to_status=failed_status,
+            reason=reason,
+        )
+    )
+    await db.commit()
+    await state.clear()
+    await notify_dispatchers(
+        message.bot,
+        db,
+        f"Проблема по заказу #{order.id}: {reason}",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="Открыть", callback_data=f"ds:card:{order.id}")]
+            ]
+        ),
+    )
+    await message.answer("Проблема передана диспетчеру.")

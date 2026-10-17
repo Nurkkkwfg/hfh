@@ -16,7 +16,7 @@ from handlers.dispatcher import (
     cancel_order,
     set_address,
     set_address_details,
-    set_pickup_day,
+    set_pickup_date,
 )
 from handlers.fallback import ROLE_HELP
 from handlers.laundry import cancel_laundry_flow, mark_ready, save_measurement, show_order
@@ -76,7 +76,7 @@ class HandlerRegressionTests(unittest.IsolatedAsyncioTestCase):
         await set_address_details(details_message, state, db=None, settings=None)
         self.assertEqual(state.data["address"], "улица Киевская, 10, подъезд 2, этаж 4, квартира 15")
         self.assertEqual(state.current_state, OrderForm.pickup_day.state)
-        self.assertIn("Адрес сохранён", details_message.answer.await_args.args[0])
+        self.assertIn("Выберите дату", details_message.answer.await_args.args[0])
 
     async def test_private_house_address_does_not_request_apartment_details(self):
         state = MemoryFSM(
@@ -93,49 +93,17 @@ class HandlerRegressionTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(state.data["address"], "улица Садовая, 5 (частный дом)")
         self.assertEqual(state.current_state, OrderForm.pickup_day.state)
-        self.assertIn("Когда забрать", callback.message.answer.await_args.args[0])
+        self.assertIn("Выберите дату", callback.message.answer.await_args.args[0])
 
-    async def test_created_order_keeps_apartment_details_but_geocodes_building_address(self):
-        engine, session_factory = create_database("sqlite+aiosqlite:///:memory:")
-        try:
-            await initialize_database(engine)
-            async with session_factory() as db:
-                address = "улица Киевская, 10, подъезд 2, этаж 4, квартира 15"
-                state = MemoryFSM(
-                    OrderForm.pickup_day.state,
-                    {
-                        "client_name": "Client",
-                        "address_base": "улица Киевская, 10",
-                        "address": address,
-                    },
-                )
-                message = SimpleNamespace(text="Завтра", answer=AsyncMock())
-                settings = SimpleNamespace(
-                    geocoder_url="https://example.test",
-                    geocoder_user_agent="test",
-                )
-                with patch(
-                    "handlers.dispatcher.geocode_bishkek_address",
-                    new_callable=AsyncMock,
-                    return_value=(42.8, 74.6),
-                ) as geocode:
-                    await set_pickup_day(message, state, db, settings)
+    async def test_pickup_date_step_stores_a_date_and_proceeds_to_slot_selection(self):
+        state = MemoryFSM(OrderForm.pickup_day.state, {"address": "улица Киевская, 10"})
+        message = SimpleNamespace(text="Завтра", answer=AsyncMock())
 
-                geocode.assert_awaited_once_with(
-                    "улица Киевская, 10",
-                    "https://example.test",
-                    "test",
-                )
-                order = await db.get(Order, 1)
-                self.assertEqual(order.address, address)
-                self.assertEqual(
-                    order.pickup_day,
-                    (bishkek_today() + timedelta(days=1)).strftime("%d.%m.%Y"),
-                )
-                self.assertEqual(order.latitude, 42.8)
-                self.assertEqual(order.longitude, 74.6)
-        finally:
-            await engine.dispose()
+        await set_pickup_date(message, state)
+
+        self.assertEqual(state.data["pickup_date"], bishkek_today() + timedelta(days=1))
+        self.assertEqual(state.current_state, OrderForm.pickup_slot.state)
+        self.assertIn("интервал", message.answer.await_args.args[0])
 
     async def test_database_middleware_is_outermost_for_every_update_type(self):
         settings = SimpleNamespace(admin_ids=frozenset({1}))
@@ -541,7 +509,7 @@ class HandlerRegressionTests(unittest.IsolatedAsyncioTestCase):
         buttons = task_message.kwargs["reply_markup"].inline_keyboard
         self.assertEqual(buttons[0][0].url, "https://2gis.kg/bishkek/geo/74.6,42.8")
 
-    async def test_dispatcher_can_only_edit_or_cancel_new_orders(self):
+    async def test_dispatcher_restricts_fields_and_cancellation_for_in_route_orders(self):
         engine, session_factory = create_database("sqlite+aiosqlite:///:memory:")
         try:
             await initialize_database(engine)
@@ -567,10 +535,14 @@ class HandlerRegressionTests(unittest.IsolatedAsyncioTestCase):
                 )
 
                 await begin_edit(edit_callback, state, db)
-                await cancel_order(cancel_callback, db)
+                edit_buttons = edit_callback.message.answer.await_args.kwargs["reply_markup"].inline_keyboard
+                labels = {button.text for row in edit_buttons for button in row}
+                self.assertEqual(labels, {"Имя", "Телефон", "Комментарий"})
+                await cancel_order(cancel_callback, state, db)
 
-                edit_callback.answer.assert_awaited_once_with("Изменять можно только новый заказ.", show_alert=True)
-                cancel_callback.answer.assert_awaited_once_with("Отменить можно только новый заказ.", show_alert=True)
+                cancel_callback.answer.assert_awaited_once_with(
+                    "Отменить можно только новый или проблемный заказ.", show_alert=True
+                )
                 await db.refresh(order)
                 self.assertEqual(order.status, "pickup_en_route")
         finally:
@@ -606,7 +578,11 @@ class HandlerRegressionTests(unittest.IsolatedAsyncioTestCase):
                 db.add(order)
                 await db.commit()
                 state = MemoryFSM("LaundryForm:measurements", {"order_id": order.id})
-                message = SimpleNamespace(text="Ковёр 3x4", answer=AsyncMock())
+                message = SimpleNamespace(
+                    text="Ковёр 3x4",
+                    answer=AsyncMock(),
+                    from_user=SimpleNamespace(id=5, full_name="Цех"),
+                )
 
                 await save_measurement(message, state, db)
                 await db.refresh(order)
@@ -615,14 +591,20 @@ class HandlerRegressionTests(unittest.IsolatedAsyncioTestCase):
 
                 callback = SimpleNamespace(
                     data=f"laundry:ready:{order.id}",
+                    from_user=SimpleNamespace(id=5, full_name="Цех"),
                     answer=AsyncMock(),
                     message=SimpleNamespace(edit_text=AsyncMock()),
+                    bot=SimpleNamespace(send_message=AsyncMock()),
                 )
                 await mark_ready(callback, db)
                 self.assertEqual(order.status, "ready")
 
                 stale_state = MemoryFSM("LaundryForm:measurements", {"order_id": order.id})
-                stale_message = SimpleNamespace(text="Повторные замеры", answer=AsyncMock())
+                stale_message = SimpleNamespace(
+                    text="Повторные замеры",
+                    answer=AsyncMock(),
+                    from_user=SimpleNamespace(id=5, full_name="Цех"),
+                )
                 await save_measurement(stale_message, stale_state, db)
                 stale_message.answer.assert_awaited_once_with("Заказ уже недоступен для изменения.")
                 self.assertIsNone(await stale_state.get_state())

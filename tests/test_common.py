@@ -27,6 +27,8 @@ class CommonTests(unittest.TestCase):
                 "delivery_en_route",
                 "delivered",
                 "cancelled",
+                "pickup_failed",
+                "delivery_failed",
             },
         )
 

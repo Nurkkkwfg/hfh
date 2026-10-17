@@ -5,8 +5,9 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 from sqlalchemy import update
 
-from database.models import Order
+from database.models import Order, OrderEvent
 from handlers.common import ROLE_LAUNDRY, RoleFilter, role_keyboard, status_label
+from utils.notify import notify_dispatchers
 
 router = Router(name="laundry")
 router.message.filter(RoleFilter(ROLE_LAUNDRY))
@@ -107,6 +108,8 @@ async def save_measurement(message: Message, state: FSMContext, db):
         return
     data = await state.get_data()
     order_id = data["order_id"]
+    order = await db.get(Order, order_id)
+    old_status = order.status if order else None
     result = await db.execute(
         update(Order)
         .where(Order.id == order_id, Order.status.in_(["picked_up", "processing"]))
@@ -117,6 +120,16 @@ async def save_measurement(message: Message, state: FSMContext, db):
         await state.clear()
         await message.answer("Заказ уже недоступен для изменения.")
         return
+    db.add(
+        OrderEvent(
+            order_id=order_id,
+            actor_id=message.from_user.id,
+            actor_name=message.from_user.full_name,
+            from_status=old_status,
+            to_status="processing",
+            note="Сохранены замеры",
+        )
+    )
     await db.commit()
     order = await db.get(Order, order_id)
     await state.clear()
@@ -131,6 +144,8 @@ async def mark_ready(callback: CallbackQuery, db):
     except (AttributeError, ValueError):
         await callback.answer("Некорректный номер заказа.", show_alert=True)
         return
+    order = await db.get(Order, order_id)
+    old_status = order.status if order else None
     result = await db.execute(
         update(Order)
         .where(Order.id == order_id, Order.status.in_(["picked_up", "processing"]))
@@ -140,7 +155,27 @@ async def mark_ready(callback: CallbackQuery, db):
         await db.rollback()
         await callback.answer("Заказ не найден или его статус уже изменился.", show_alert=True)
         return
+    db.add(
+        OrderEvent(
+            order_id=order_id,
+            actor_id=callback.from_user.id,
+            actor_name=callback.from_user.full_name,
+            from_status=old_status,
+            to_status="ready",
+            note="Заказ готов к доставке",
+        )
+    )
     await db.commit()
+    await notify_dispatchers(
+        callback.bot,
+        db,
+        f"Заказ #{order_id} готов в цехе.",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="Открыть", callback_data=f"ds:card:{order_id}")]
+            ]
+        ),
+    )
     await callback.answer("Заказ добавлен в очередь доставки.")
     if callback.message:
         await callback.message.edit_text(f"Заказ #{order_id}: готов к доставке.")

@@ -3,7 +3,7 @@ from aiogram.filters import BaseFilter
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton, Message, ReplyKeyboardMarkup
 
 from database.models import User
-from utils.dates import format_bishkek_datetime
+from utils.dates import format_bishkek_datetime, format_pickup_date, parse_pickup_day
 
 ROLE_DISPATCHER = "dispatcher"
 ROLE_COURIER = "courier"
@@ -18,6 +18,8 @@ STATUS_LABELS = {
     "delivery_en_route": "Курьер везёт клиенту",
     "delivered": "Доставлен",
     "cancelled": "Отменён",
+    "pickup_failed": "Не удалось забрать",
+    "delivery_failed": "Не удалось доставить",
 }
 
 
@@ -54,7 +56,12 @@ class RoleFilter(BaseFilter):
 
 def role_keyboard(role: str) -> ReplyKeyboardMarkup:
     if role == ROLE_DISPATCHER:
-        rows = [["➕ Новая заявка", "📋 Заказы"]]
+        rows = [
+            ["➕ Новая заявка", "🔎 Поиск"],
+            ["📋 Заказы", "⚠️ Проблемные"],
+            ["📅 На сегодня", "📊 Сводка дня"],
+            ["❓ Помощь"],
+        ]
     elif role == ROLE_COURIER:
         rows = [["🟢 Начать смену", "🔴 Завершить смену"], ["📋 Мои задачи"]]
     elif role == ROLE_LAUNDRY:
@@ -65,9 +72,27 @@ def role_keyboard(role: str) -> ReplyKeyboardMarkup:
 
 
 async def send_order_card(message: Message, order, *, show_dispatcher_actions: bool = False) -> None:
+    pickup_date = getattr(order, "pickup_date", None)
+    if pickup_date is None:
+        pickup_date = parse_pickup_day(getattr(order, "pickup_day", ""))
+
+    raw_items = getattr(order, "items", None)
+    items = raw_items or "не указано"
+    try:
+        import json
+
+        items = ", ".join(json.loads(raw_items or "[]")) or "не указано"
+    except (TypeError, ValueError):
+        pass
     text = (
-        f"Заказ #{order.id}\nКлиент: {order.client_name}\nАдрес: {order.address}\n"
-        f"Забор: {order.pickup_day}\nСтатус: {status_label(order.status)}\n"
+        f"Заказ #{order.id}\nСтатус: {status_label(order.status)}\n"
+        f"Клиент: {order.client_name}\nТелефон: {getattr(order, 'client_phone', '') or 'не указан'}\n"
+        f"Адрес: {order.address}\n"
+        f"Забор: {format_pickup_date(pickup_date)} {getattr(order, 'pickup_slot', 'Любое')}\n"
+        f"Что забрать: {items}\n"
+        f"Комментарий: {getattr(order, 'comment', None) or 'нет'}\n"
+        f"Сумма: {getattr(order, 'total_amount', 0)} сом\n"
+        f"Оплата: {'оплачено' if getattr(order, 'is_paid', False) else 'не оплачено'}\n"
         f"Создан: {format_bishkek_datetime(order.created_at)}"
     )
     if order.measurements:
@@ -76,7 +101,7 @@ async def send_order_card(message: Message, order, *, show_dispatcher_actions: b
         keyboard = InlineKeyboardMarkup(
             inline_keyboard=[
                 [InlineKeyboardButton(text="✏️ Изменить", callback_data=f"dispatch:edit:{order.id}")],
-                [InlineKeyboardButton(text="❌ Отменить", callback_data=f"dispatch:cancel:{order.id}")],
+                [InlineKeyboardButton(text="❌ Отменить", callback_data=f"ds:cancel:{order.id}")],
             ]
         )
         await message.answer(text, reply_markup=keyboard)

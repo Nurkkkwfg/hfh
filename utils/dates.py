@@ -39,7 +39,18 @@ def parse_pickup_day(value: str, *, today: date | None = None) -> date | None:
         return None
 
 
+def pickup_date_value(value: str, *, today: date | None = None) -> date | None:
+    pickup_date = parse_pickup_day(value, today=today)
+    if pickup_date is None or pickup_date < (today or bishkek_today()):
+        return None
+    return pickup_date
+
+
 def format_bishkek_datetime(value: datetime) -> str:
     if value.tzinfo is None:
         value = value.replace(tzinfo=timezone.utc)
     return value.astimezone(BISHKEK_TZ).strftime("%d.%m.%Y %H:%M")
+
+
+def format_pickup_date(value: date) -> str:
+    return value.strftime("%d.%m")
