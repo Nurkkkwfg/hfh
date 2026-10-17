@@ -1,7 +1,6 @@
 from aiogram import BaseMiddleware
 from aiogram.filters import BaseFilter
-from aiogram.types import CallbackQuery, KeyboardButton, Message, ReplyKeyboardMarkup
-from sqlalchemy import select
+from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton, Message, ReplyKeyboardMarkup
 
 from database.models import User
 
@@ -9,6 +8,20 @@ ROLE_DISPATCHER = "dispatcher"
 ROLE_COURIER = "courier"
 ROLE_LAUNDRY = "laundry"
 ROLE_ADMIN = "super_admin"
+STATUS_LABELS = {
+    "new": "Новый",
+    "pickup_en_route": "Курьер едет за заказом",
+    "picked_up": "В цехе",
+    "processing": "В обработке",
+    "ready": "Готов к доставке",
+    "delivery_en_route": "Курьер везёт клиенту",
+    "delivered": "Доставлен",
+    "cancelled": "Отменён",
+}
+
+
+def status_label(status: str) -> str:
+    return STATUS_LABELS.get(status, status)
 
 
 class DatabaseMiddleware(BaseMiddleware):
@@ -53,13 +66,11 @@ def role_keyboard(role: str) -> ReplyKeyboardMarkup:
 async def send_order_card(message: Message, order, *, show_dispatcher_actions: bool = False) -> None:
     text = (
         f"Заказ #{order.id}\nКлиент: {order.client_name}\nАдрес: {order.address}\n"
-        f"Забор: {order.pickup_day}\nСтатус: {order.status}"
+        f"Забор: {order.pickup_day}\nСтатус: {status_label(order.status)}"
     )
     if order.measurements:
         text += f"\nЗамеры: {order.measurements}"
     if show_dispatcher_actions:
-        from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
-
         keyboard = InlineKeyboardMarkup(
             inline_keyboard=[
                 [InlineKeyboardButton(text="✏️ Изменить", callback_data=f"dispatch:edit:{order.id}")],

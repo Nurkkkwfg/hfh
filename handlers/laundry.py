@@ -5,7 +5,7 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
 from database.models import Order
-from handlers.common import ROLE_LAUNDRY, RoleFilter
+from handlers.common import ROLE_LAUNDRY, RoleFilter, status_label
 
 router = Router(name="laundry")
 router.message.filter(RoleFilter(ROLE_LAUNDRY))
@@ -15,6 +15,23 @@ router.callback_query.filter(RoleFilter(ROLE_LAUNDRY))
 class LaundryForm(StatesGroup):
     order_id = State()
     measurements = State()
+
+
+@router.message(Command("help"))
+async def laundry_help(message: Message):
+    await message.answer(
+        "Цех: нажмите «Найти заказ» или отправьте /order 15. В карточке добавьте замеры "
+        "и отметьте заказ готовым к доставке. Отправьте /cancel, чтобы прервать ввод номера или замеров."
+    )
+
+
+@router.message(Command("cancel"))
+async def cancel_laundry_flow(message: Message, state: FSMContext):
+    if await state.get_state() is None:
+        await message.answer("Сейчас нет незавершённого действия.")
+        return
+    await state.clear()
+    await message.answer("Действие отменено.", reply_markup=ReplyKeyboardRemove())
 
 
 @router.message(Command("order"))
@@ -60,7 +77,7 @@ async def show_order(message: Message, db, raw_order_id: str):
         ]
     text = (
         f"Заказ #{order.id}\nКлиент: {order.client_name}\nАдрес: {order.address}\n"
-        f"Статус: {order.status}\nЗамеры: {order.measurements or 'не добавлены'}"
+        f"Статус: {status_label(order.status)}\nЗамеры: {order.measurements or 'не добавлены'}"
     )
     await message.answer(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons) if buttons else None)
 

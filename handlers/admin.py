@@ -21,6 +21,11 @@ ROLE_LABELS = {
     ROLE_COURIER: "Курьер",
     ROLE_LAUNDRY: "Прачечная / цех",
 }
+ASSIGNABLE_ROLES = {
+    ROLE_DISPATCHER: ROLE_LABELS[ROLE_DISPATCHER],
+    ROLE_COURIER: ROLE_LABELS[ROLE_COURIER],
+    ROLE_LAUNDRY: ROLE_LABELS[ROLE_LAUNDRY],
+}
 
 
 @router.message(CommandStart())
@@ -47,10 +52,12 @@ async def start(message: Message, db, bot: Bot, settings: Settings, user_role: s
         )
         db.add(user)
         await db.commit()
+
+    if not user.is_approved:
         keyboard = InlineKeyboardMarkup(
             inline_keyboard=[
                 [InlineKeyboardButton(text=label, callback_data=f"staff:role:{person.id}:{role}")]
-                for role, label in ROLE_LABELS.items()
+                for role, label in ASSIGNABLE_ROLES.items()
             ]
         )
         for admin_id in settings.admin_ids:
@@ -73,6 +80,7 @@ async def start(message: Message, db, bot: Bot, settings: Settings, user_role: s
 @router.message(F.text == "👥 Сотрудники")
 async def list_staff(message: Message, db, settings: Settings):
     if message.from_user.id not in settings.admin_ids:
+        await message.answer("Команда доступна только администраторам.")
         return
     users = (await db.scalars(select(User).order_by(User.created_at.desc()))).all()
     if not users:
@@ -95,13 +103,16 @@ async def assign_role(callback: CallbackQuery, db, bot: Bot, settings: Settings)
     except (AttributeError, ValueError):
         await callback.answer("Некорректный запрос.", show_alert=True)
         return
-    if role not in ROLE_LABELS:
+    if role not in ASSIGNABLE_ROLES:
         await callback.answer("Неизвестная роль.", show_alert=True)
         return
 
     user = await db.get(User, user_id)
     if user is None:
         await callback.answer("Пользователь не найден.", show_alert=True)
+        return
+    if user.is_approved:
+        await callback.answer("Пользователь уже одобрен.", show_alert=True)
         return
     user.role, user.is_approved = role, True
     await db.commit()

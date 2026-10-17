@@ -4,7 +4,7 @@ from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMar
 from sqlalchemy import select
 
 from database.models import Order, User
-from handlers.common import ROLE_COURIER, RoleFilter
+from handlers.common import ROLE_COURIER, RoleFilter, role_keyboard, status_label
 from utils.geo import haversine_km, sort_orders_by_distance
 
 router = Router(name="courier")
@@ -19,7 +19,10 @@ async def start_shift(message: Message, db):
     user.is_on_shift = True
     await db.commit()
     keyboard = ReplyKeyboardMarkup(
-        keyboard=[[KeyboardButton(text="📍 Отправить геопозицию", request_location=True)]],
+        keyboard=[
+            [KeyboardButton(text="📍 Отправить геопозицию", request_location=True)],
+            [KeyboardButton(text="🔴 Завершить смену")],
+        ],
         resize_keyboard=True,
         one_time_keyboard=True,
     )
@@ -36,7 +39,7 @@ async def end_shift(message: Message, db):
     user = await db.get(User, message.from_user.id)
     user.is_on_shift = False
     await db.commit()
-    await message.answer("Смена завершена.")
+    await message.answer("Смена завершена.", reply_markup=role_keyboard(ROLE_COURIER))
 
 
 async def save_location(message: Message, db, *, notify: bool = True):
@@ -101,7 +104,7 @@ async def show_tasks(message: Message, db, courier: User):
         )
         text = (
             f"Заказ #{order.id}\nКлиент: {order.client_name}\nАдрес: {order.address}\n"
-            f"Забор: {order.pickup_day}\nСтатус: {order.status}\nДо адреса: {distance}"
+            f"Забор: {order.pickup_day}\nСтатус: {status_label(order.status)}\nДо адреса: {distance}"
         )
         buttons = []
         if order.latitude is not None and order.longitude is not None:
@@ -156,4 +159,4 @@ async def update_order_status(callback: CallbackQuery, db):
     await db.commit()
     await callback.answer("Статус заказа обновлён.")
     if callback.message:
-        await callback.message.edit_text(f"Заказ #{order.id}: {order.status}")
+        await callback.message.edit_text(f"Заказ #{order.id}: {status_label(order.status)}")

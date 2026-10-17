@@ -6,7 +6,7 @@ from aiogram.fsm.storage.memory import MemoryStorage
 
 from config import Settings
 from database.session import create_database, initialize_database
-from handlers import admin, courier, dispatcher as dispatcher_handlers, laundry
+from handlers import admin, courier, dispatcher as dispatcher_handlers, fallback, laundry
 from handlers.common import DatabaseMiddleware
 
 
@@ -26,6 +26,7 @@ async def main() -> None:
     dp.include_router(dispatcher_handlers.router)
     dp.include_router(courier.router)
     dp.include_router(laundry.router)
+    dp.include_router(fallback.router)
 
     try:
         await dp.start_polling(bot)

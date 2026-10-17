@@ -16,13 +16,13 @@ async def geocode_bishkek_address(address: str, endpoint: str, user_agent: str) 
             await asyncio.sleep(delay)
         try:
             async with httpx.AsyncClient(timeout=8.0, headers={"User-Agent": user_agent}) as client:
+                _last_request_at = time.monotonic()
                 response = await client.get(
                     endpoint,
                     params={"q": f"{address}, Bishkek, Kyrgyzstan", "format": "jsonv2", "limit": 1},
                 )
                 response.raise_for_status()
                 results = response.json()
-                _last_request_at = time.monotonic()
         except (httpx.HTTPError, ValueError):
             return None
 
