@@ -123,6 +123,8 @@ async def assign_role(callback: CallbackQuery, db, bot: Bot, settings: Settings)
         await db.rollback()
         await callback.answer("Пользователь уже одобрен.", show_alert=True)
         return
+    user.role = role
+    user.is_approved = True
     await db.commit()
     await callback.answer("Роль назначена.")
     if callback.message:

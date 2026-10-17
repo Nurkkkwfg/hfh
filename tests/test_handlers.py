@@ -99,6 +99,61 @@ class HandlerRegressionTests(unittest.IsolatedAsyncioTestCase):
         bot.send_message.assert_not_awaited()
         callback.answer.assert_awaited_once_with("Неизвестная роль.", show_alert=True)
 
+    async def test_assign_role_updates_the_loaded_user_record(self):
+        engine, session_factory = create_database("sqlite+aiosqlite:///:memory:")
+        try:
+            await initialize_database(engine)
+            async with session_factory() as db:
+                user = User(telegram_id=52, full_name="Pending Staff", is_approved=False)
+                db.add(user)
+                await db.commit()
+
+                callback = SimpleNamespace(
+                    from_user=SimpleNamespace(id=1),
+                    data="staff:role:52:dispatcher",
+                    answer=AsyncMock(),
+                    message=None,
+                )
+                bot = SimpleNamespace(send_message=AsyncMock())
+                settings = SimpleNamespace(admin_ids=frozenset({1}))
+
+                await assign_role(callback, db, bot, settings)
+
+                self.assertTrue(user.is_approved)
+                self.assertEqual(user.role, "dispatcher")
+        finally:
+            await engine.dispose()
+
+    async def test_pickup_claim_updates_the_loaded_order_record(self):
+        engine, session_factory = create_database("sqlite+aiosqlite:///:memory:")
+        try:
+            await initialize_database(engine)
+            async with session_factory() as db:
+                courier = User(
+                    telegram_id=101,
+                    full_name="Courier One",
+                    role=ROLE_COURIER,
+                    is_approved=True,
+                    is_on_shift=True,
+                )
+                order = Order(client_name="Client", address="Street 1", pickup_day="Сегодня")
+                db.add_all([courier, order])
+                await db.commit()
+
+                callback = SimpleNamespace(
+                    from_user=SimpleNamespace(id=101),
+                    data=f"courier:pickup:{order.id}",
+                    answer=AsyncMock(),
+                    message=SimpleNamespace(edit_text=AsyncMock()),
+                )
+
+                await update_order_status(callback, db)
+
+                self.assertEqual(order.status, "pickup_en_route")
+                self.assertEqual(order.pickup_courier_id, 101)
+        finally:
+            await engine.dispose()
+
     async def test_pickup_claim_is_exclusive_and_requires_active_shift(self):
         engine, session_factory = create_database("sqlite+aiosqlite:///:memory:")
         try:

@@ -174,6 +174,10 @@ async def update_order_status(callback: CallbackQuery, db):
         await db.rollback()
         await callback.answer("Задача уже изменена или закреплена за другим курьером.", show_alert=True)
         return
+    order = await db.get(Order, order_id)
+    if order is not None:
+        order.status = transition[1]
+        setattr(order, owner_field, courier_id)
     await db.commit()
     await callback.answer("Статус заказа обновлён.")
     if callback.message:
