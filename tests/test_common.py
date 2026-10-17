@@ -1,11 +1,16 @@
 import unittest
 from datetime import date
 
-from handlers.common import STATUS_LABELS, status_label
+from handlers.common import ROLE_ADMIN, STATUS_LABELS, role_keyboard, status_label
 from utils.dates import normalize_pickup_day
 
 
 class CommonTests(unittest.TestCase):
+    def test_admin_keyboard_exposes_all_admin_sections(self):
+        keyboard = role_keyboard(ROLE_ADMIN)
+        labels = {button.text for row in keyboard.keyboard for button in row}
+        self.assertEqual(labels, {"👥 Сотрудники", "⏳ Заявки", "📊 Статистика", "📦 Заказы"})
+
     def test_order_statuses_have_human_readable_labels(self):
         self.assertEqual(status_label("pickup_en_route"), "Курьер едет за заказом")
         self.assertEqual(status_label("unrecognized"), "unrecognized")

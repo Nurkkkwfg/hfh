@@ -2,15 +2,81 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
-from handlers.admin import assign_role, start
+from handlers.admin import assign_role, change_staff_role, disable_staff, start, admin_cancel_order
 from database.models import Order, User
 from database.session import create_database, initialize_database
-from handlers.common import ROLE_COURIER
+from handlers.common import DatabaseMiddleware, ROLE_COURIER
 from handlers.courier import update_order_status
 from handlers.laundry import cancel_laundry_flow
+from main import create_dispatcher
 
 
 class HandlerRegressionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_database_middleware_is_outermost_for_every_update_type(self):
+        settings = SimpleNamespace(admin_ids=frozenset({1}))
+        dispatcher = create_dispatcher(settings, session_factory=None)
+
+        for observer in (dispatcher.message, dispatcher.edited_message, dispatcher.callback_query):
+            self.assertTrue(
+                any(isinstance(middleware, DatabaseMiddleware) for middleware in observer.outer_middleware._middlewares)
+            )
+
+    async def test_admin_can_change_role_disable_staff_and_cancel_order(self):
+        engine, session_factory = create_database("sqlite+aiosqlite:///:memory:")
+        try:
+            await initialize_database(engine)
+            async with session_factory() as db:
+                staff = User(
+                    telegram_id=52,
+                    full_name="Staff Member",
+                    role=ROLE_COURIER,
+                    is_approved=True,
+                    is_on_shift=True,
+                    latitude=42.8,
+                    longitude=74.6,
+                )
+                order = Order(client_name="Client", address="Street 1", pickup_day="Сегодня")
+                db.add_all([staff, order])
+                await db.commit()
+                bot = SimpleNamespace(send_message=AsyncMock())
+                settings = SimpleNamespace(admin_ids=frozenset({1}))
+
+                def make_callback(data):
+                    return SimpleNamespace(
+                        from_user=SimpleNamespace(id=1),
+                        data=data,
+                        answer=AsyncMock(),
+                        message=SimpleNamespace(
+                            edit_reply_markup=AsyncMock(),
+                            edit_text=AsyncMock(),
+                            answer=AsyncMock(),
+                        ),
+                    )
+
+                await change_staff_role(make_callback("staff:change:52:dispatcher"), db, bot, settings)
+                self.assertEqual(staff.role, "dispatcher")
+                bot.send_message.assert_awaited_with(
+                    52,
+                    "Ваша роль изменена: Диспетчер.",
+                    reply_markup=unittest.mock.ANY,
+                )
+
+                await disable_staff(make_callback("staff:disable:52"), db, bot, settings)
+                self.assertFalse(staff.is_approved)
+                self.assertIsNone(staff.role)
+                self.assertFalse(staff.is_on_shift)
+                self.assertIsNone(staff.latitude)
+                self.assertIsNone(staff.longitude)
+
+                await admin_cancel_order(
+                    make_callback(f"admin:order:cancel:{order.id}"),
+                    db,
+                    settings,
+                )
+                self.assertEqual(order.status, "cancelled")
+        finally:
+            await engine.dispose()
+
     async def test_laundry_cancel_clears_state_and_restores_role_keyboard(self):
         state = SimpleNamespace(get_state=AsyncMock(return_value="LaundryForm:measurements"), clear=AsyncMock())
         message = SimpleNamespace(answer=AsyncMock())

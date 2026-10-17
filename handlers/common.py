@@ -59,7 +59,7 @@ def role_keyboard(role: str) -> ReplyKeyboardMarkup:
     elif role == ROLE_LAUNDRY:
         rows = [["🔎 Найти заказ"]]
     else:
-        rows = [["👥 Сотрудники"]]
+        rows = [["👥 Сотрудники", "⏳ Заявки"], ["📊 Статистика", "📦 Заказы"]]
     return ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text=label) for label in row] for row in rows], resize_keyboard=True)
 
 
