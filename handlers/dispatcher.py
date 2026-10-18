@@ -1,8 +1,6 @@
 import json
 import logging
 import re
-from urllib.parse import quote
-
 from datetime import date, datetime, time, timedelta, timezone
 from zoneinfo import ZoneInfo
 from aiogram import F, Router
@@ -272,7 +270,7 @@ async def record_event(
 async def dispatcher_help(message: Message):
     await message.answer(
         "Диспетчер:\n"
-        "➕ Новая заявка — телефон, клиент, адрес (проверьте через 2ГИС), дата, интервал и вещи.\n"
+        "➕ Новая заявка — телефон, клиент, адрес (проверьте по карте), дата, интервал и вещи.\n"
         "🔎 Поиск — номер, телефон, имя или адрес; 📋 Заказы — список с фильтрами.\n"
         "⚠️ Проблемные — просроченные и требующие внимания заказы; 📅 На сегодня — сегодняшние заборы.\n"
         "Отменять заказ, менять адрес или дату можно только в статусах «Новый» и «Проблема»; "
@@ -372,35 +370,64 @@ async def set_client_name(message: Message, state: FSMContext):
     await state.update_data(client_name=value)
     await state.set_state(OrderForm.address)
     await message.answer(
-        "Введите улицу и номер дома. Подъезд, этаж и квартиру добавим после проверки адреса в 2ГИС:",
+        "Введите улицу и номер дома. Подъезд, этаж и квартиру добавим после проверки адреса на карте:",
         reply_markup=step_back_markup("client_name"),
     )
 
 
-@router.message(OrderForm.address)
-async def set_address(message: Message, state: FSMContext):
-    value = (message.text or "").strip()
-    if not value:
-        await message.answer("Адрес не должен быть пустым. Введите полный адрес:")
-        return
-    await state.update_data(address_base=value)
-    await state.set_state(OrderForm.address_confirm)
-    keyboard = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(
-                text="🔎 Проверить адрес в 2ГИС",
-                url=f"https://2gis.kg/bishkek/search/{quote(value, safe='')}",
-            )],
-            [InlineKeyboardButton(text="✅ Адрес проверен", callback_data="dispatch:address:confirm")],
+def address_confirmation_markup(*, can_confirm: bool) -> InlineKeyboardMarkup:
+    rows = []
+    if can_confirm:
+        rows.append([InlineKeyboardButton(text="✅ Адрес на карте верный", callback_data="dispatch:address:confirm")])
+    rows.extend(
+        [
             [InlineKeyboardButton(text="✏️ Изменить адрес", callback_data="dispatch:address:edit")],
             [InlineKeyboardButton(text="◀️ Назад", callback_data="ds:back:client_name")],
         ]
     )
-    await message.answer(
-        f"Проверьте, что найден именно нужный адрес:\n{value}\n"
-        "Откройте поиск 2ГИС, сверьте улицу и номер дома, затем подтвердите адрес.",
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def address_map_url(latitude: float, longitude: float) -> str:
+    point = f"{latitude},{longitude}"
+    return (
+        "https://staticmap.openstreetmap.de/staticmap.php"
+        f"?center={point}&zoom=16&size=600x400&markers={point},red-pushpin"
+    )
+
+
+async def prompt_address_confirmation(message: Message, address: str, coordinates: tuple[float, float] | None):
+    keyboard = address_confirmation_markup(can_confirm=coordinates is not None)
+    if coordinates is None:
+        await message.answer(
+            f"Не удалось найти адрес на карте: {address}\nИзмените адрес и попробуйте снова.",
+            reply_markup=keyboard,
+        )
+        return
+    latitude, longitude = coordinates
+    await message.answer_photo(
+        photo=address_map_url(latitude, longitude),
+        caption=f"Проверьте точку на карте для адреса:\n{address}",
         reply_markup=keyboard,
     )
+
+
+@router.message(OrderForm.address)
+async def set_address(message: Message, state: FSMContext, settings: Settings):
+    value = (message.text or "").strip()
+    if not value:
+        await message.answer("Адрес не должен быть пустым. Введите полный адрес:")
+        return
+    coordinates = await geocode_bishkek_address(
+        value, settings.geocoder_url, settings.geocoder_user_agent
+    )
+    await state.update_data(
+        address_base=value,
+        latitude=coordinates[0] if coordinates else None,
+        longitude=coordinates[1] if coordinates else None,
+    )
+    await state.set_state(OrderForm.address_confirm)
+    await prompt_address_confirmation(message, value, coordinates)
 
 
 @router.callback_query(F.data == "dispatch:address:confirm")
@@ -432,7 +459,7 @@ async def edit_address_input(callback: CallbackQuery, state: FSMContext):
         return
     await state.set_state(OrderForm.address)
     if callback.message:
-        await callback.message.answer("Введите адрес улицы и дома для нового поиска в 2ГИС:")
+        await callback.message.answer("Введите адрес улицы и дома для поиска на карте:")
     await callback.answer()
 
 
@@ -580,9 +607,9 @@ async def go_back(callback: CallbackQuery, state: FSMContext, db):
         "client_name": (OrderForm.client_name, "Введите имя клиента:"),
         "address": (
             OrderForm.address,
-            "Введите улицу и номер дома для поиска в 2ГИС:",
+            "Введите улицу и номер дома для поиска на карте:",
         ),
-        "address_confirm": (OrderForm.address_confirm, "Подтвердите адрес в 2ГИС или измените его."),
+        "address_confirm": (OrderForm.address_confirm, "Проверьте адрес на карте или измените его."),
         "address_type": (OrderForm.address_type, "Выберите тип жилья."),
         "address_details": (OrderForm.address_details, "Укажите подъезд, этаж и квартиру."),
         "pickup_day": (OrderForm.pickup_day, "Выберите дату забора."),
@@ -599,20 +626,9 @@ async def go_back(callback: CallbackQuery, state: FSMContext, db):
         data = await state.get_data()
         if previous == "address_confirm" and data.get("address_base"):
             value = data["address_base"]
-            keyboard = InlineKeyboardMarkup(
-                inline_keyboard=[
-                    [
-                        InlineKeyboardButton(
-                            text="🔎 Проверить адрес в 2ГИС",
-                            url=f"https://2gis.kg/bishkek/search/{quote(value, safe='')}",
-                        )
-                    ],
-                    [InlineKeyboardButton(text="✅ Адрес проверен", callback_data="dispatch:address:confirm")],
-                    [InlineKeyboardButton(text="✏️ Изменить адрес", callback_data="dispatch:address:edit")],
-                    [InlineKeyboardButton(text="◀️ Назад", callback_data="ds:back:client_name")],
-                ]
-            )
-            await callback.message.answer(f"Проверьте адрес:\n{value}", reply_markup=keyboard)
+            latitude, longitude = data.get("latitude"), data.get("longitude")
+            coordinates = (latitude, longitude) if latitude is not None and longitude is not None else None
+            await prompt_address_confirmation(callback.message, value, coordinates)
         elif previous == "address_type":
             keyboard = InlineKeyboardMarkup(
                 inline_keyboard=[
@@ -870,7 +886,7 @@ async def edit_review_field(callback: CallbackQuery, state: FSMContext):
     if field == "address":
         await state.update_data(address_flow="create")
         await state.set_state(OrderForm.address)
-        prompt = "Введите улицу и номер дома для проверки в 2ГИС:"
+        prompt = "Введите улицу и номер дома для поиска на карте:"
     elif field == "items":
         await state.set_state(OrderForm.items)
         if callback.message:
@@ -1253,7 +1269,7 @@ async def begin_fix_address(callback: CallbackQuery, state: FSMContext, db):
     await state.set_state(OrderForm.address)
     if callback.message:
         await callback.message.answer(
-            "Введите улицу и номер дома для проверки в 2ГИС:",
+            "Введите улицу и номер дома для поиска на карте:",
             reply_markup=step_back_markup("order_card"),
         )
     await callback.answer()
@@ -1611,7 +1627,7 @@ async def choose_edit_field(callback: CallbackQuery, state: FSMContext, db):
         await state.set_state(OrderForm.address)
         if callback.message:
             await callback.message.answer(
-                "Введите улицу и номер дома для поиска в 2ГИС:",
+                "Введите улицу и номер дома для поиска на карте:",
                 reply_markup=step_back_markup("address"),
             )
     elif field == "pickup_slot":

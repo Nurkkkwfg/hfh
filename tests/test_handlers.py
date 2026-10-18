@@ -14,6 +14,7 @@ from handlers.dispatcher import (
     choose_address_type,
     confirm_address,
     cancel_order,
+    go_back,
     set_address,
     set_address_details,
     set_pickup_date,
@@ -49,22 +50,27 @@ class MemoryFSM:
 class HandlerRegressionTests(unittest.IsolatedAsyncioTestCase):
     async def test_address_search_confirmation_and_apartment_details(self):
         state = MemoryFSM(OrderForm.address.state, {"address_flow": "create"})
-        message = SimpleNamespace(text="улица Киевская, 10", answer=AsyncMock())
+        message = SimpleNamespace(text="улица Киевская, 10", answer=AsyncMock(), answer_photo=AsyncMock())
+        settings = SimpleNamespace(geocoder_url="https://geo.test", geocoder_user_agent="tests")
 
-        await set_address(message, state)
+        with patch("handlers.dispatcher.geocode_bishkek_address", new_callable=AsyncMock, return_value=(42.8, 74.6)):
+            await set_address(message, state, settings)
 
         self.assertEqual(state.current_state, OrderForm.address_confirm.state)
-        markup = message.answer.await_args.kwargs["reply_markup"]
-        search_button = markup.inline_keyboard[0][0]
-        self.assertEqual(search_button.text, "🔎 Проверить адрес в 2ГИС")
-        self.assertIn("2gis.kg/bishkek/search/", search_button.url)
-        self.assertEqual(markup.inline_keyboard[1][0].callback_data, "dispatch:address:confirm")
+        photo_call = message.answer_photo.await_args
+        self.assertIn("42.8,74.6", photo_call.kwargs["photo"])
+        markup = photo_call.kwargs["reply_markup"]
+        self.assertEqual(markup.inline_keyboard[0][0].callback_data, "dispatch:address:confirm")
 
         callback = SimpleNamespace(
-            data="dispatch:address:confirm",
+            data="ds:back:address_confirm",
             answer=AsyncMock(),
-            message=SimpleNamespace(answer=AsyncMock()),
+            message=SimpleNamespace(answer=AsyncMock(), answer_photo=AsyncMock()),
         )
+        await go_back(callback, state, db=None)
+        callback.message.answer_photo.assert_awaited_once()
+
+        callback.data = "dispatch:address:confirm"
         await confirm_address(callback, state)
         self.assertEqual(state.current_state, OrderForm.address_type.state)
 
@@ -77,6 +83,24 @@ class HandlerRegressionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(state.data["address"], "улица Киевская, 10, подъезд 2, этаж 4, квартира 15")
         self.assertEqual(state.current_state, OrderForm.pickup_day.state)
         self.assertIn("Выберите дату", details_message.answer.await_args.args[0])
+
+    async def test_address_without_map_match_cannot_be_confirmed(self):
+        state = MemoryFSM(OrderForm.address.state, {"address_flow": "create"})
+        message = SimpleNamespace(text="Неизвестная улица, 999", answer=AsyncMock(), answer_photo=AsyncMock())
+        settings = SimpleNamespace(geocoder_url="https://geo.test", geocoder_user_agent="tests")
+
+        with patch("handlers.dispatcher.geocode_bishkek_address", new_callable=AsyncMock, return_value=None):
+            await set_address(message, state, settings)
+
+        message.answer_photo.assert_not_awaited()
+        self.assertIn("Не удалось найти адрес", message.answer.await_args.args[0])
+        buttons = message.answer.await_args.kwargs["reply_markup"].inline_keyboard
+        self.assertNotIn(
+            "dispatch:address:confirm",
+            [button.callback_data for row in buttons for button in row],
+        )
+        self.assertIsNone(state.data["latitude"])
+        self.assertIsNone(state.data["longitude"])
 
     async def test_private_house_address_does_not_request_apartment_details(self):
         state = MemoryFSM(
