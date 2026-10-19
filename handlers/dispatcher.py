@@ -389,12 +389,10 @@ def address_confirmation_markup(*, can_confirm: bool) -> InlineKeyboardMarkup:
 
 
 def address_map_url(latitude: float, longitude: float) -> str:
+    point = f"{latitude},{longitude}"
     return (
-        "https://static.maps.2gis.com/1.0"
-        f"?center={longitude},{latitude}"
-        f"&zoom=16"
-        f"&size=600,400"
-        f"&markers={longitude},{latitude}"
+        "https://staticmap.openstreetmap.de/staticmap.php"
+        f"?center={point}&zoom=16&size=600x400&markers={point},red-pushpin"
     )
 
 
@@ -483,18 +481,17 @@ async def choose_address_type(callback: CallbackQuery, state: FSMContext, db, se
         await callback.answer()
         return
     await state.set_state(OrderForm.address_details)
-    if callback.message:
-        keyboard = InlineKeyboardMarkup(
-            inline_keyboard=[
-                [InlineKeyboardButton(text="Пропустить уточнения", callback_data="dispatch:address:skip")],
-                [InlineKeyboardButton(text="◀️ Назад", callback_data="ds:back:address_type")],
-            ]
-        )
-        await callback.message.answer(
-            "Укажите подъезд, этаж и квартиру (например: подъезд 2, этаж 4, квартира 15). "
-            "Можно написать только известные данные.",
-            reply_markup=keyboard,
-        )
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="Пропустить уточнения", callback_data="dispatch:address:skip")],
+            [InlineKeyboardButton(text="◀️ Назад", callback_data="ds:back:address_type")],
+        ]
+    )
+    await callback.message.answer(
+        "Укажите подъезд, этаж и квартиру (например: подъезд 2, этаж 4, квартира 15). "
+        "Можно написать только известные данные.",
+        reply_markup=keyboard,
+    )
     await callback.answer()
 
 
