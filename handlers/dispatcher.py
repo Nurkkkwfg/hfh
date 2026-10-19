@@ -389,10 +389,12 @@ def address_confirmation_markup(*, can_confirm: bool) -> InlineKeyboardMarkup:
 
 
 def address_map_url(latitude: float, longitude: float) -> str:
-    point = f"{latitude},{longitude}"
     return (
-        "https://staticmap.openstreetmap.de/staticmap.php"
-        f"?center={point}&zoom=16&size=600x400&markers={point},red-pushpin"
+        "https://static.maps.2gis.com/1.0"
+        f"?center={longitude},{latitude}"
+        f"&zoom=16"
+        f"&size=600,400"
+        f"&markers={longitude},{latitude}"
     )
 
 
@@ -484,8 +486,8 @@ async def choose_address_type(callback: CallbackQuery, state: FSMContext, db, se
     if callback.message:
         keyboard = InlineKeyboardMarkup(
             inline_keyboard=[
-                [InlineKeyboardButton(text="Пропустить уточнения", callback_data="dispatch:address:skip")]
-                , [InlineKeyboardButton(text="◀️ Назад", callback_data="ds:back:address_type")]
+                [InlineKeyboardButton(text="Пропустить уточнения", callback_data="dispatch:address:skip")],
+                [InlineKeyboardButton(text="◀️ Назад", callback_data="ds:back:address_type")],
             ]
         )
         await callback.message.answer(
