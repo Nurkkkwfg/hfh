@@ -389,6 +389,16 @@ def address_confirmation_markup(*, can_confirm: bool) -> InlineKeyboardMarkup:
 
 
 def address_map_url(latitude: float, longitude: float) -> str:
+    return (
+        "https://static.maps.2gis.com/1.0"
+        f"?center={longitude},{latitude}"
+        f"&zoom=16"
+        f"&size=600,400"
+        f"&markers={longitude},{latitude}"
+    )
+
+
+def address_map_url_fallback(latitude: float, longitude: float) -> str:
     point = f"{latitude},{longitude}"
     return (
         "https://staticmap.openstreetmap.de/staticmap.php"
@@ -405,11 +415,18 @@ async def prompt_address_confirmation(message: Message, address: str, coordinate
         )
         return
     latitude, longitude = coordinates
-    await message.answer_photo(
-        photo=address_map_url(latitude, longitude),
-        caption=f"Проверьте точку на карте для адреса:\n{address}",
-        reply_markup=keyboard,
-    )
+    try:
+        await message.answer_photo(
+            photo=address_map_url(latitude, longitude),
+            caption=f"Проверьте точку на карте для адреса:\n{address}",
+            reply_markup=keyboard,
+        )
+    except Exception:
+        await message.answer_photo(
+            photo=address_map_url_fallback(latitude, longitude),
+            caption=f"Проверьте точку на карте для адреса:\n{address}",
+            reply_markup=keyboard,
+        )
 
 
 @router.message(OrderForm.address)
@@ -481,17 +498,18 @@ async def choose_address_type(callback: CallbackQuery, state: FSMContext, db, se
         await callback.answer()
         return
     await state.set_state(OrderForm.address_details)
-    keyboard = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="Пропустить уточнения", callback_data="dispatch:address:skip")],
-            [InlineKeyboardButton(text="◀️ Назад", callback_data="ds:back:address_type")],
-        ]
-    )
-    await callback.message.answer(
-        "Укажите подъезд, этаж и квартиру (например: подъезд 2, этаж 4, квартира 15). "
-        "Можно написать только известные данные.",
-        reply_markup=keyboard,
-    )
+    if callback.message:
+        keyboard = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="Пропустить уточнения", callback_data="dispatch:address:skip")],
+                [InlineKeyboardButton(text="◀️ Назад", callback_data="ds:back:address_type")],
+            ]
+        )
+        await callback.message.answer(
+            "Укажите подъезд, этаж и квартиру (например: подъезд 2, этаж 4, квартира 15). "
+            "Можно написать только известные данные.",
+            reply_markup=keyboard,
+        )
     await callback.answer()
 
 
